@@ -2,7 +2,7 @@
 
 Every method takes the caller and runs in one transaction that starts with
 `SET LOCAL ROLE <tier>` and `set_config('board.actor', <identity>, true)`. The pool's
-login (board_app) has no rights of its own, so nothing here works outside such a
+login (board_app) has no rights on these tables, so nothing here works outside such a
 transaction, and both settings end with it: the next caller on the same pooled connection
 starts with neither.
 

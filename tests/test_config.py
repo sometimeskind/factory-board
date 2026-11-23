@@ -8,7 +8,7 @@ import psycopg
 import pytest
 
 from factory_board.__main__ import main
-from factory_board.config import DEFAULT_MIGRATIONS_DIR, ConfigError, Settings
+from factory_board.config import DEFAULT_MIGRATIONS_DIR, ConfigError, ServerSettings, Settings
 
 
 def test_each_url_is_required_only_when_asked_for() -> None:
@@ -90,3 +90,68 @@ def test_migrate_command_without_a_database_url(
     monkeypatch.delenv("FACTORY_BOARD_MIGRATE_DATABASE_URL", raising=False)
     assert main(["migrate"]) == 1
     assert "FACTORY_BOARD_MIGRATE_DATABASE_URL is not set" in capsys.readouterr().err
+
+
+SERVER_ENV = {
+    "FACTORY_BOARD_BASE_URL": "https://board.example.test",
+    "FACTORY_BOARD_OIDC_CONFIG_URL": "https://id.example.test/.well-known/openid-configuration",
+    "FACTORY_BOARD_OIDC_CLIENT_ID": "factory-board",
+    "FACTORY_BOARD_OIDC_CLIENT_SECRET": "s3cret",
+    "FACTORY_BOARD_JWT_SIGNING_KEY": "jwt-key",
+    "FACTORY_BOARD_STORAGE_KEY": "storage-key",
+    "FACTORY_BOARD_ROUTE_HEADER": "X-Board-Route",
+}
+
+
+def test_the_server_settings_have_two_defaults() -> None:
+    settings = ServerSettings.from_env(SERVER_ENV)
+    assert settings.operator_group == "factory-operators"
+    assert settings.allowed_redirects == ("https://claude.ai/api/mcp/auth_callback",)
+    assert settings.session_token_sha256 is None
+    assert settings.nightly_token_sha256 is None
+
+
+@pytest.mark.parametrize("name", sorted(SERVER_ENV))
+def test_each_server_setting_is_required(name: str) -> None:
+    env = {key: value for key, value in SERVER_ENV.items() if key != name}
+    with pytest.raises(ConfigError, match=f"{name} is not set"):
+        ServerSettings.from_env(env)
+    with pytest.raises(ConfigError, match=f"{name} is not set"):
+        ServerSettings.from_env(env | {name: "  "})
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        ({"FACTORY_BOARD_SESSION_TOKEN_SHA256": "A" * 64}, "SESSION_TOKEN_SHA256 must be"),
+        ({"FACTORY_BOARD_NIGHTLY_TOKEN_SHA256": "abc"}, "NIGHTLY_TOKEN_SHA256 must be"),
+        (
+            {
+                "FACTORY_BOARD_SESSION_TOKEN_SHA256": "a" * 64,
+                "FACTORY_BOARD_NIGHTLY_TOKEN_SHA256": "a" * 64,
+            },
+            "must differ",
+        ),
+        ({"FACTORY_BOARD_ROUTE_HEADER": "X Board Route"}, "not a header name"),
+        ({"FACTORY_BOARD_ALLOWED_REDIRECTS": " , "}, "names no redirect URI"),
+    ],
+)
+def test_an_unusable_server_setting_is_refused(extra: dict[str, str], message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        ServerSettings.from_env(SERVER_ENV | extra)
+
+
+def test_the_token_hashes_and_redirects_are_read() -> None:
+    settings = ServerSettings.from_env(
+        SERVER_ENV
+        | {
+            "FACTORY_BOARD_SESSION_TOKEN_SHA256": "a" * 64,
+            "FACTORY_BOARD_NIGHTLY_TOKEN_SHA256": "b" * 64,
+            "FACTORY_BOARD_OPERATOR_GROUP": "board-people",
+            "FACTORY_BOARD_ALLOWED_REDIRECTS": "https://one.example/cb, http://localhost:*",
+        }
+    )
+    assert settings.session_token_sha256 == "a" * 64
+    assert settings.nightly_token_sha256 == "b" * 64
+    assert settings.operator_group == "board-people"
+    assert settings.allowed_redirects == ("https://one.example/cb", "http://localhost:*")

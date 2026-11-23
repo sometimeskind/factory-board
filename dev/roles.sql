@@ -6,7 +6,7 @@
 -- The passwords here are for throwaway databases only.
 --
 --   board_owner     owns the database and the tables; the migrations run as it
---   board_app       the server's login; holds no rights of its own (NOINHERIT) and
+--   board_app       the server's login; holds no rights on the items (NOINHERIT) and
 --                   takes one tier per transaction with SET LOCAL ROLE
 --   board_operator  tier: the operator
 --   board_agent     tier: interactive sessions, and later the pipeline's runs

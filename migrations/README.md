@@ -24,5 +24,6 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 | `0001_items.sql` | The role check; the `items` table with its checks, the three uniqueness rules, the list index, and the trigger that makes a closed item final |
 | `0002_replies.sql` | The `replies` table |
 | `0003_access.sql` | The column grants, row-level security and its policies, and `set_pr_head_sha` |
+| `0004_oauth_proxy.sql` | The login proxy's key-value table, the one table `board_app` uses as itself |
 
 The `schema_migrations` table is created by the runner itself.

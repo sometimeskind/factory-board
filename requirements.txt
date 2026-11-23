@@ -1,3 +1,8 @@
 psycopg[binary]==3.3.9
 psycopg-pool==3.3.3
 pydantic==2.14.4
+fastmcp==4.1.4
+py-key-value-aio[postgresql]==0.4.6
+asyncpg==0.32.0
+cryptography==50.0.2
+prometheus-client==0.26.0
