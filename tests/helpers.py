@@ -34,8 +34,8 @@ def pr(number: int, repo: str = REPO) -> Subject:
     return Subject("pr", str(number), repo)
 
 
-def manual(number: int = 101, *, held_by: str | None = OPERATOR.identity) -> NewItem:
-    """A step for the operator on a made-up issue."""
+def manual(number: int = 101, *, held_by: str = OPERATOR.identity) -> NewItem:
+    """A step for the operator on a made-up issue. A person or a process holds it."""
     return NewItem(
         assignee="operator",
         kind="manual",
@@ -101,6 +101,16 @@ def insert_row(conn: psycopg.Connection, **overrides: Any) -> None:
         sql.SQL(", ").join(sql.Placeholder() for _ in row),
     )
     conn.execute(query, list(row.values()))
+
+
+def insert_stage_row(conn: psycopg.Connection, item_id: str, **overrides: Any) -> None:
+    """A stage's item (a `work` item unless told otherwise), which anyone or nobody may hold."""
+    stage_name = overrides.pop("assignee", "work")
+    insert_row(
+        conn,
+        **{"id": item_id, "assignee": stage_name, "kind": stage_name, "claimed_by": None}
+        | overrides,
+    )
 
 
 def row_of(conn: psycopg.Connection, item_id: str) -> tuple[Any, ...]:

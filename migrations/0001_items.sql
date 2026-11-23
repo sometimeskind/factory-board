@@ -85,6 +85,11 @@ CREATE TABLE items (
     reasons text[] NOT NULL DEFAULT '{}',
     input_hash text,
 
+    -- Each time a PR item's head SHA moved after the item was written: the old and the new
+    -- SHA, who moved it and when. Only set_pr_head_sha appends to it.
+    head_sha_moves jsonb NOT NULL DEFAULT '[]'
+        CONSTRAINT items_head_sha_moves_array CHECK (jsonb_typeof(head_sha_moves) = 'array'),
+
     -- Provenance: who wrote the item, in which run or session, and whether the operator
     -- typed into that run.
     created_by text NOT NULL
@@ -121,7 +126,15 @@ CREATE TABLE items (
         END
     ),
     CONSTRAINT items_pr_kind_on_pr
-        CHECK (kind NOT IN ('pr-approve', 'pr-merge') OR subject_type = 'pr')
+        CHECK (kind NOT IN ('pr-approve', 'pr-merge') OR subject_type = 'pr'),
+    -- An item on the operator's list is always held by a person or a process, never by a
+    -- session or a run and never by nobody. The agent tier can change no such row, so what
+    -- the operator has read can't be rewritten under them.
+    CONSTRAINT items_operator_item_holder
+        CHECK (
+            assignee <> 'operator'
+            OR (claimed_by IS NOT NULL AND claimed_by ~ '^(human|process):')
+        )
 );
 
 -- At most one open item per stage and subject. The operator may have several open items

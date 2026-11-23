@@ -12,6 +12,11 @@ checks that a row came back and raises a typed error if none did.
 
 These are primitives. Which verb closes what, which fields a kind carries and who may
 call what are the layers above.
+
+The store believes its caller. The server must build the `Caller` from the authenticated
+token, and take `created_by`, `created_run` and `operator_typed` from the token too, never
+from a tool's input: the policies bind what is written to board.actor, and board.actor is
+whatever the server sets.
 """
 
 from __future__ import annotations
@@ -162,6 +167,7 @@ class Item:
     releases: int
     reasons: tuple[str, ...]
     input_hash: str | None
+    head_sha_moves: tuple[dict[str, Any], ...]
     created_by: str
     created_run: str | None
     operator_typed: bool
@@ -222,6 +228,7 @@ def _item(row: DictRow) -> Item:
         releases=row["releases"],
         reasons=tuple(row["reasons"]),
         input_hash=row["input_hash"],
+        head_sha_moves=tuple(row["head_sha_moves"]),
         created_by=row["created_by"],
         created_run=row["created_run"],
         operator_typed=row["operator_typed"],
@@ -270,6 +277,13 @@ class Store:
             raise translated from exc
 
     @staticmethod
+    def _run_of(caller: Caller) -> str | None:
+        """An agent's run or session ID, which is the part of its identity after the colon."""
+        if caller.tier is Tier.AGENT:
+            return caller.identity.partition(":")[2]
+        return None
+
+    @staticmethod
     async def _fetch(conn: Connection, item_id: str) -> Item | None:
         cur = await conn.cursor(row_factory=dict_row).execute(
             "SELECT * FROM items WHERE id = %s", (item_id,)
@@ -305,7 +319,8 @@ class Store:
         """Insert an item, or return the open item that already stands in its place.
 
         The existing item is returned as it is, with one exception: a new head SHA on a
-        PR item is written to the existing item, since that is what a second push means.
+        PR item is written to the existing item, since that is what a second push means
+        (not for the operator tier, which does not push).
         """
         subject = new.subject
         params: dict[str, Any] = {
@@ -323,7 +338,7 @@ class Store:
             "reasons": list(new.reasons),
             "input_hash": new.input_hash,
             "created_by": caller.identity,
-            "created_run": new.created_run,
+            "created_run": new.created_run or self._run_of(caller),
             "operator_typed": new.operator_typed,
         }
         for _ in range(_CREATE_ATTEMPTS):
@@ -353,12 +368,14 @@ class Store:
                     continue
                 head_sha = new.fields.get("head_sha")
                 if (
-                    existing.kind in PR_KINDS
+                    caller.tier is not Tier.OPERATOR
+                    and existing.kind in PR_KINDS
                     and new.kind in PR_KINDS
                     and isinstance(head_sha, str)
                     and existing.fields.get("head_sha") != head_sha
                 ):
-                    existing = await self._set_head_sha(conn, caller, existing.id, head_sha)
+                    assert new.subject is not None
+                    existing = await self._set_head_sha(conn, existing.id, new.subject, head_sha)
                 return Created(existing, existing=True)
         raise StoreError(f"no free item ID after {_CREATE_ATTEMPTS} tries")
 
@@ -448,49 +465,48 @@ class Store:
             )
 
     async def set_not_before(self, caller: Caller, item_id: str, when: datetime | None) -> Item:
+        """Defer an open item, or with None end the deferral. The operator tier only."""
         async with self._as(caller) as conn:
             return await self._update_open(
                 conn, item_id, sql.SQL("not_before = %(when)s"), {"when": when}
             )
 
     async def set_urgent(self, caller: Caller, item_id: str, urgent: bool) -> Item:
+        """Bump an open item, or take the bump back. The operator tier only."""
         async with self._as(caller) as conn:
             return await self._update_open(
                 conn, item_id, sql.SQL("urgent = %(urgent)s"), {"urgent": urgent}
             )
 
-    async def set_head_sha(self, caller: Caller, item_id: str, head_sha: str) -> Item:
-        """Move the head SHA of an open pr-approve or pr-merge item, whoever holds it."""
+    async def set_head_sha(self, caller: Caller, item_id: str, pr: Subject, head_sha: str) -> Item:
+        """Move the head SHA of an open pr-approve or pr-merge item, whoever holds it.
+
+        For the agent and process tiers: whoever pushes again. The caller names the PR as
+        well as the item, and the two must agree. The move is recorded on the item
+        (`head_sha_moves`). No tier may update `fields` itself, and the database function
+        behind this is not granted to the operator.
+        """
         async with self._as(caller) as conn:
-            return await self._set_head_sha(conn, caller, item_id, head_sha)
+            return await self._set_head_sha(conn, item_id, pr, head_sha)
 
     async def _set_head_sha(
-        self, conn: Connection, caller: Caller, item_id: str, head_sha: str
+        self, conn: Connection, item_id: str, pr: Subject, head_sha: str
     ) -> Item:
         if not _HEAD_SHA_RE.match(head_sha):
             raise InvalidItem("a head SHA is 40 lower-case hex characters")
-        if caller.tier is Tier.OPERATOR:
-            # The operator may update any row; the function is for the tiers that may not.
-            cur = await conn.cursor(row_factory=dict_row).execute(
-                """
-                UPDATE items SET fields = jsonb_set(fields, '{head_sha}', to_jsonb(%(sha)s::text))
-                WHERE id = %(id)s AND closed_at IS NULL AND kind IN ('pr-approve', 'pr-merge')
-                RETURNING *
-                """,
-                {"id": item_id, "sha": head_sha},
-            )
-            row = await cur.fetchone()
-            item = None if row is None else _item(row)
-        else:
-            cur = await conn.execute("SELECT set_pr_head_sha(%s, %s)", (item_id, head_sha))
-            changed = await cur.fetchone()
-            item = await self._fetch(conn, item_id) if changed == (True,) else None
-        if item is not None:
-            return item
+        cur = await conn.execute(
+            "SELECT set_pr_head_sha(%s, %s, %s, %s)", (item_id, pr.repo, pr.ref, head_sha)
+        )
+        if await cur.fetchone() == (True,):
+            item = await self._fetch(conn, item_id)
+            if item is not None:
+                return item
         refusal = await self._refusal(conn, item_id)
         if isinstance(refusal, NotClaimHolder):
-            # Open and found, so it was the kind that did not match.
-            raise InvalidItem(f"item {item_id} is not a pr-approve or pr-merge item")
+            # Open and found, so it is not a PR item, or not that PR's.
+            raise InvalidItem(
+                f"item {item_id} is not a pr-approve or pr-merge item on {pr.repo}#{pr.ref}"
+            )
         raise refusal
 
     async def add_reply(self, caller: Caller, item_id: str, body: str) -> Reply:

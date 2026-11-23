@@ -94,7 +94,6 @@ async def test_create_then_get(store: Store) -> None:
         machine="workstation",
         claimed_by=OPERATOR.identity,
         urgent=True,
-        created_run="0a1b2c3d",
         operator_typed=True,
     )
     created = await store.create_item(SESSION, new)
@@ -109,6 +108,7 @@ async def test_create_then_get(store: Store) -> None:
     assert (item.created_run, item.operator_typed, item.urgent) == ("0a1b2c3d", True, True)
     assert item.is_open and item.resolution is None and item.result is None
     assert (item.expiries, item.releases, item.reasons, item.input_hash) == (0, 0, (), None)
+    assert item.head_sha_moves == ()
     assert item.claim_expires is None and item.not_before is None
     assert abs(datetime.now(UTC) - item.created_at) < timedelta(minutes=1)
     for caller in EVERY_CALLER:
@@ -126,14 +126,35 @@ async def test_get_of_a_missing_item(store: Store) -> None:
         NewItem(assignee="somebody", kind="manual", subject=issue(101)),
         NewItem(assignee="operator", kind="wish", subject=issue(101)),
         NewItem(assignee="operator", kind="manual", subject=issue(101), claimed_by="operator"),
-        NewItem(assignee="operator", kind="manual", subject=issue(101), machine="toaster"),
-        NewItem(assignee="operator", kind="manual"),
+        replace(manual(), machine="toaster"),
+        replace(manual(), subject=None),
+        # The operator's item is held by a person or a process, never by its writer.
+        NewItem(assignee="operator", kind="manual", subject=issue(101)),
+        NewItem(
+            assignee="operator", kind="manual", subject=issue(101), claimed_by=SESSION.identity
+        ),
     ],
 )
 async def test_create_of_a_bad_item_is_refused(store: Store, pool: Pool, new: NewItem) -> None:
     with pytest.raises(InvalidItem, match="refused by items_"):
         await store.create_item(SESSION, new)
     assert await count(pool) == 0
+
+
+async def test_provenance_comes_from_the_caller(store: Store) -> None:
+    """An agent's item carries its own run or session; it can't name another."""
+    by_session = (await store.create_item(SESSION, manual(101))).item
+    by_run = (await store.create_item(RUN, manual(102))).item
+    by_process = (await store.create_item(RECONCILER, manual(103))).item
+    by_operator = (await store.create_item(OPERATOR, manual(104))).item
+    assert (by_session.created_by, by_session.created_run) == ("session:0a1b2c3d", "0a1b2c3d")
+    assert (by_run.created_by, by_run.created_run) == ("run:20260101-work-01", "20260101-work-01")
+    assert (by_process.created_by, by_process.created_run) == ("process:reconciler", None)
+    assert (by_operator.created_by, by_operator.created_run) == ("human:operator", None)
+    with pytest.raises(NotPermitted):
+        await store.create_item(SESSION, replace(manual(105), created_run="9z8y7x6w"))
+    with pytest.raises(NotPermitted):
+        await store.create_item(RECONCILER, replace(manual(105), operator_typed=True))
 
 
 async def test_a_bad_id_is_refused(pool: Pool) -> None:
@@ -195,7 +216,13 @@ async def test_the_operator_gets_several_items_on_one_issue(store: Store, pool: 
     second = await store.create_item(SESSION, manual(101))
     third = await store.create_item(
         OTHER_SESSION,
-        NewItem(assignee="operator", kind="decision", subject=issue(101), fields={"options": []}),
+        NewItem(
+            assignee="operator",
+            kind="decision",
+            subject=issue(101),
+            fields={"options": []},
+            claimed_by=OPERATOR.identity,
+        ),
     )
     assert [c.existing for c in (first, second, third)] == [False, False, False]
     assert len({first.item.id, second.item.id, third.item.id}) == 3
@@ -243,7 +270,7 @@ async def test_a_second_open_pr_item_returns_the_first(store: Store, pool: Pool)
     assert (await store.create_item(SESSION, other_repo)).existing is False
 
 
-@pytest.mark.parametrize("caller", [SESSION, RECONCILER, OPERATOR], ids=lambda c: c.identity)
+@pytest.mark.parametrize("caller", [SESSION, RECONCILER], ids=lambda c: c.identity)
 async def test_a_second_pr_item_with_a_new_head_moves_the_sha_only(
     store: Store, pool: Pool, caller: Caller
 ) -> None:
@@ -257,9 +284,20 @@ async def test_a_second_pr_item_with_a_new_head_moves_the_sha_only(
     )
     again = await store.create_item(caller, newer)
     assert again.existing is True
-    assert again.item == replace(first, fields={**first.fields, "head_sha": SHA_B})
+    moves = again.item.head_sha_moves
+    assert [(m["from"], m["to"], m["by"]) for m in moves] == [(SHA_A, SHA_B, caller.identity)]
+    assert again.item == replace(
+        first, fields={**first.fields, "head_sha": SHA_B}, head_sha_moves=moves
+    )
     assert await store.get_item(OPERATOR, first.id) == again.item
     assert await count(pool) == 1
+
+
+async def test_the_operator_s_second_pr_item_moves_nothing(store: Store) -> None:
+    """The operator does not push, and the function is not theirs to call."""
+    first = (await store.create_item(SESSION, pr_approve(202, SHA_A))).item
+    again = await store.create_item(OPERATOR, pr_approve(202, SHA_B))
+    assert (again.existing, again.item) == (True, first)
 
 
 async def test_a_pr_item_can_follow_a_closed_one(store: Store) -> None:
@@ -310,16 +348,20 @@ async def test_two_creates_at_once_make_one_item(migrated: None, app_url: str) -
         (OPERATOR, "process:reconciler", True),
         (OPERATOR, "session:0a1b2c3d", True),
         (OPERATOR, None, True),
+        (SESSION, "session:0a1b2c3d", True),
+        (SESSION, "session:9z8y7x6w", False),
+        (SESSION, "run:20260101-work-01", False),
+        (SESSION, None, False),
         (SESSION, "human:operator", False),
         (SESSION, "process:reconciler", False),
-        (SESSION, "session:0a1b2c3d", True),
-        (SESSION, "session:9z8y7x6w", True),
-        (RUN, "human:operator", False),
         (RUN, "run:20260101-work-01", True),
+        (RUN, "session:0a1b2c3d", False),
+        (RUN, "human:operator", False),
         (RECONCILER, "process:reconciler", True),
         (RECONCILER, "process:nightly", False),
         (RECONCILER, "human:operator", False),
         (RECONCILER, "session:0a1b2c3d", False),
+        (RECONCILER, None, False),
         (NIGHTLY, "process:nightly", True),
         (NIGHTLY, "process:reconciler", False),
     ],
@@ -328,9 +370,14 @@ async def test_two_creates_at_once_make_one_item(migrated: None, app_url: str) -
 async def test_who_may_close_whose_item(
     store: Store, closer: Caller, holder: str | None, allowed: bool
 ) -> None:
-    item = (await store.create_item(SESSION, manual(101, held_by=holder))).item
+    """An item is closed by its claim holder, or by the operator."""
+    if holder is not None and holder.startswith(("human:", "process:")):
+        new = manual(101, held_by=holder)
+    else:
+        new = stage("work", 101, held_by=holder)
+    item = (await store.create_item(RECONCILER, new)).item
     if not allowed:
-        with pytest.raises(NotClaimHolder, match=f"item {item.id} is held by {holder}"):
+        with pytest.raises(NotClaimHolder, match=f"item {item.id} is held by {holder or 'nobody'}"):
             await store.close_item(closer, item.id, Resolution.DONE, {"note": "widgets made"})
         assert await store.get_item(OPERATOR, item.id) == item
         return
@@ -360,32 +407,33 @@ async def test_close_of_a_missing_item(store: Store) -> None:
         await store.close_item(OPERATOR, "zzzzzzzz", Resolution.DONE)
 
 
-@pytest.mark.parametrize("caller", [OPERATOR, SESSION], ids=lambda c: c.tier.name)
-async def test_a_closed_item_stays_as_it_is(store: Store, caller: Caller) -> None:
+async def test_a_closed_item_stays_as_it_is(store: Store) -> None:
     """There is no undo: every write on a closed item is refused, for every tier."""
     item = (await store.create_item(SESSION, pr_approve(202))).item
     closed = await store.close_item(OPERATOR, item.id, Resolution.DONE, {"note": "approved"})
+    for caller in (OPERATOR, SESSION, RECONCILER):
+        with pytest.raises(ItemClosed):
+            await store.close_item(caller, item.id, Resolution.REJECTED, {"note": "no"})
     with pytest.raises(ItemClosed):
-        await store.close_item(caller, item.id, Resolution.REJECTED, {"note": "no"})
+        await store.set_urgent(OPERATOR, item.id, True)
     with pytest.raises(ItemClosed):
-        await store.set_urgent(caller, item.id, True)
-    with pytest.raises(ItemClosed):
-        await store.set_not_before(caller, item.id, datetime.now(UTC))
-    with pytest.raises(ItemClosed):
-        await store.set_head_sha(caller, item.id, SHA_B)
+        await store.set_not_before(OPERATOR, item.id, datetime.now(UTC))
+    for caller in (SESSION, RECONCILER):
+        with pytest.raises(ItemClosed):
+            await store.set_head_sha(caller, item.id, pr(202), SHA_B)
     assert await store.get_item(OPERATOR, item.id) == closed
 
 
-async def test_the_trigger_s_refusal_is_a_closed_item(store: Store, pool: Pool) -> None:
+async def test_the_trigger_s_refusal_is_a_closed_item(store: Store) -> None:
     """A write that gets past the store's own `closed_at IS NULL` still ends as ItemClosed."""
-    item = (await store.create_item(SESSION, manual(101, held_by=None))).item
+    item = (await store.create_item(RECONCILER, stage("work", 101, held_by=SESSION.identity))).item
     await store.close_item(SESSION, item.id, Resolution.DONE)
     with pytest.raises(ItemClosed, match="is closed and cannot be changed"):
         async with store._as(SESSION) as conn:  # pyright: ignore[reportPrivateUsage]
-            await conn.execute("UPDATE items SET urgent = true WHERE id = %s", (item.id,))
+            await conn.execute("UPDATE items SET result = '{}' WHERE id = %s", (item.id,))
 
 
-# The other writes follow the same policy
+# Deferring and bumping are the operator's
 
 
 async def test_set_not_before_and_urgent(store: Store) -> None:
@@ -399,52 +447,82 @@ async def test_set_not_before_and_urgent(store: Store) -> None:
     back = await store.set_not_before(OPERATOR, item.id, None)
     assert back == replace(item, urgent=True)
     assert await store.list_open(OPERATOR) == [back]
-
-
-async def test_an_agent_cannot_defer_or_bump_the_operator_s_item(store: Store) -> None:
-    item = (await store.create_item(SESSION, manual())).item
-    with pytest.raises(NotClaimHolder):
-        await store.set_urgent(SESSION, item.id, True)
-    with pytest.raises(NotClaimHolder):
-        await store.set_not_before(RECONCILER, item.id, datetime.now(UTC))
     with pytest.raises(ItemNotFound):
         await store.set_urgent(OPERATOR, "zzzzzzzz", True)
-    assert await store.get_item(OPERATOR, item.id) == item
 
 
-@pytest.mark.parametrize("caller", [SESSION, RUN, RECONCILER, OPERATOR], ids=lambda c: c.identity)
-async def test_set_head_sha_changes_only_the_sha(store: Store, caller: Caller) -> None:
+@pytest.mark.parametrize("caller", [SESSION, RUN, RECONCILER], ids=lambda c: c.identity)
+async def test_no_other_tier_defers_or_bumps(store: Store, caller: Caller) -> None:
+    """Not the operator's item, and not even the caller's own."""
+    theirs = (await store.create_item(SESSION, manual())).item
+    own = (await store.create_item(RECONCILER, stage("work", 102, held_by=caller.identity))).item
+    for item in (theirs, own):
+        with pytest.raises(NotPermitted):
+            await store.set_urgent(caller, item.id, True)
+        with pytest.raises(NotPermitted):
+            await store.set_not_before(caller, item.id, datetime.now(UTC))
+        assert await store.get_item(OPERATOR, item.id) == item
+
+
+# The head SHA of a PR item
+
+
+@pytest.mark.parametrize("caller", [SESSION, RUN, RECONCILER], ids=lambda c: c.identity)
+async def test_set_head_sha_changes_the_sha_and_records_the_move(
+    store: Store, caller: Caller
+) -> None:
     item = (await store.create_item(SESSION, pr_approve(202, SHA_A))).item
     assert item.claimed_by == "human:operator"
-    moved = await store.set_head_sha(caller, item.id, SHA_B)
-    assert moved == replace(item, fields={**item.fields, "head_sha": SHA_B})
+    before = datetime.now(UTC) - timedelta(minutes=1)
+    moved = await store.set_head_sha(caller, item.id, pr(202), SHA_B)
+    (move,) = moved.head_sha_moves
+    assert (move["from"], move["to"], move["by"]) == (SHA_A, SHA_B, caller.identity)
+    assert datetime.fromisoformat(move["at"]) > before
+    assert moved == replace(item, fields={**item.fields, "head_sha": SHA_B}, head_sha_moves=(move,))
+    # The operator sees the move on the item.
     assert await store.get_item(OPERATOR, item.id) == moved
+    assert (await store.list_open(OPERATOR))[0].head_sha_moves == (move,)
+    # The same SHA again is no move.
+    assert await store.set_head_sha(caller, item.id, pr(202), SHA_B) == moved
 
 
 @pytest.mark.parametrize("caller", [SESSION, RUN, RECONCILER], ids=lambda c: c.identity)
 async def test_moving_the_head_sha_is_not_a_way_to_close(store: Store, caller: Caller) -> None:
     item = (await store.create_item(SESSION, pr_approve(202, SHA_A))).item
-    moved = await store.set_head_sha(caller, item.id, SHA_B)
+    moved = await store.set_head_sha(caller, item.id, pr(202), SHA_B)
     with pytest.raises(NotClaimHolder):
         await store.close_item(caller, item.id, Resolution.DONE)
-    with pytest.raises(NotClaimHolder):
-        await store.set_urgent(caller, item.id, True)
     assert await store.get_item(OPERATOR, item.id) == moved
     assert moved.is_open
 
 
-@pytest.mark.parametrize("caller", [SESSION, RECONCILER, OPERATOR], ids=lambda c: c.identity)
-async def test_set_head_sha_is_for_open_pr_items(store: Store, caller: Caller) -> None:
-    other = (await store.create_item(SESSION, manual(101, held_by=None))).item
-    with pytest.raises(InvalidItem, match="not a pr-approve or pr-merge item"):
-        await store.set_head_sha(caller, other.id, SHA_B)
-    with pytest.raises(ItemNotFound):
-        await store.set_head_sha(caller, "zzzzzzzz", SHA_B)
+@pytest.mark.parametrize("caller", [SESSION, RECONCILER], ids=lambda c: c.identity)
+async def test_set_head_sha_needs_the_item_s_own_pr(store: Store, caller: Caller) -> None:
     item = (await store.create_item(SESSION, pr_approve(202, SHA_A))).item
+    other_pr = (await store.create_item(SESSION, pr_approve(203, SHA_A))).item
+    other = (await store.create_item(SESSION, manual(101))).item
+    for item_id, named in [
+        (item.id, pr(203)),
+        (item.id, pr(202, "example/other")),
+        (other_pr.id, pr(202)),
+        (other.id, pr(202)),
+        (other.id, pr(101)),
+    ]:
+        with pytest.raises(InvalidItem, match="is not a pr-approve or pr-merge item on example/"):
+            await store.set_head_sha(caller, item_id, named, SHA_B)
+    with pytest.raises(ItemNotFound):
+        await store.set_head_sha(caller, "zzzzzzzz", pr(202), SHA_B)
     for bad in ("", "abc", "A" * 40, "a" * 41):
         with pytest.raises(InvalidItem, match="40 lower-case hex"):
-            await store.set_head_sha(caller, item.id, bad)
-    assert await store.get_item(OPERATOR, other.id) == other
+            await store.set_head_sha(caller, item.id, pr(202), bad)
+    for unchanged in (item, other_pr, other):
+        assert await store.get_item(OPERATOR, unchanged.id) == unchanged
+
+
+async def test_the_operator_tier_does_not_move_a_head_sha(store: Store) -> None:
+    item = (await store.create_item(SESSION, pr_approve(202, SHA_A))).item
+    with pytest.raises(NotPermitted):
+        await store.set_head_sha(OPERATOR, item.id, pr(202), SHA_B)
     assert await store.get_item(OPERATOR, item.id) == item
 
 
@@ -470,7 +548,7 @@ async def test_replies(store: Store) -> None:
 
 @pytest.mark.parametrize("caller", [SESSION, RUN, RECONCILER], ids=lambda c: c.identity)
 async def test_only_the_operator_replies(store: Store, caller: Caller) -> None:
-    item = (await store.create_item(SESSION, manual(101, held_by=caller.identity))).item
+    item = (await store.create_item(SESSION, stage("work", 101, held_by=caller.identity))).item
     with pytest.raises(NotPermitted):
         await store.add_reply(caller, item.id, "done already")
     assert await store.list_replies(OPERATOR, item.id) == []

@@ -7,7 +7,7 @@ from typing import Any
 
 import psycopg
 import pytest
-from helpers import insert_row
+from helpers import insert_row, insert_stage_row
 from psycopg import errors
 from psycopg.types.json import Jsonb
 
@@ -62,6 +62,11 @@ def test_a_valid_row_is_accepted(owner: psycopg.Connection) -> None:
         ({"claimed_by": "human:operator\n"}, "items_claimed_by_identity"),
         ({"claimed_by": "robot:r2"}, "items_claimed_by_identity"),
         ({"claimed_by": "process:a b"}, "items_claimed_by_identity"),
+        # The operator's item is held by a person or a process.
+        ({"claimed_by": None}, "items_operator_item_holder"),
+        ({"claimed_by": "session:0a1b2c3d"}, "items_operator_item_holder"),
+        ({"claimed_by": "run:20260101-work-01"}, "items_operator_item_holder"),
+        ({"head_sha_moves": Jsonb({"not": "a list"})}, "items_head_sha_moves_array"),
         ({"created_by": "somebody"}, "items_created_by_identity"),
         ({"created_by": "PROCESS:reconciler"}, "items_created_by_identity"),
         # The rest of the fixed lists and shapes.
@@ -109,7 +114,15 @@ def test_the_five_resolutions_are_accepted(owner: psycopg.Connection, resolution
     ["human:operator", "process:reconciler", "run:20260101-work-01", "session:0a1b2c3d"],
 )
 def test_the_four_identity_prefixes_are_accepted(owner: psycopg.Connection, identity: str) -> None:
-    insert_row(owner, claimed_by=identity, created_by=identity)
+    insert_stage_row(owner, "abcdefgh", claimed_by=identity, created_by=identity)
+    assert count(owner) == 1
+
+
+@pytest.mark.parametrize("holder", ["human:operator", "process:nightly"])
+def test_the_operator_s_item_may_be_held_by_a_person_or_a_process(
+    owner: psycopg.Connection, holder: str
+) -> None:
+    insert_row(owner, claimed_by=holder)
     assert count(owner) == 1
 
 
