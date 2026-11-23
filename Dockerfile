@@ -1,4 +1,4 @@
-FROM python:3.14-slim AS build
+FROM python:3.15-slim AS build
 
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH
@@ -6,7 +6,7 @@ COPY factory_board/ /build/factory_board/
 COPY pyproject.toml requirements.txt /build/
 RUN pip install --no-cache-dir -r /build/requirements.txt /build
 
-FROM python:3.14-slim AS prod
+FROM python:3.15-slim AS prod
 
 COPY --from=build /opt/venv /opt/venv
 # The migrations ship with the image; `python -m factory_board migrate` applies them.
