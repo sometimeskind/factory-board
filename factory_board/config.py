@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,3 +55,79 @@ class Settings:
         if not self.migrate_database_url:
             raise ConfigError(f"{MIGRATE_URL_VAR} is not set")
         return self.migrate_database_url
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_HEADER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,63}")
+
+CLAUDE_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
+
+
+@dataclass(frozen=True)
+class ServerSettings:
+    """What the server needs to know who is calling. All of it is required to serve.
+
+    The operator signs in through Pocket ID and must be in `operator_group`. The two static
+    tokens are configured as SHA-256 hashes only, and are accepted only on a request whose
+    `route_header` says `private`: the private HTTPRoute sets that header, overwriting
+    whatever the client sent, and the public one sets `public`.
+    """
+
+    base_url: str
+    oidc_config_url: str
+    oidc_client_id: str
+    oidc_client_secret: str
+    jwt_signing_key: str
+    storage_key: str
+    operator_group: str
+    allowed_redirects: tuple[str, ...]
+    route_header: str
+    # Interactive sessions on pilot share one token; the nightly has its own.
+    session_token_sha256: str | None = None
+    nightly_token_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("FACTORY_BOARD_SESSION_TOKEN_SHA256", self.session_token_sha256),
+            ("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256", self.nightly_token_sha256),
+        ):
+            if value is not None and not _SHA256_HEX.fullmatch(value):
+                raise ConfigError(f"{name} must be 64 lower-case hex characters")
+        if (
+            self.session_token_sha256 is not None
+            and self.session_token_sha256 == self.nightly_token_sha256
+        ):
+            raise ConfigError("the session token and the nightly token must differ")
+        if not _HEADER_NAME.fullmatch(self.route_header):
+            raise ConfigError("FACTORY_BOARD_ROUTE_HEADER is not a header name")
+        if not self.allowed_redirects:
+            raise ConfigError("FACTORY_BOARD_ALLOWED_REDIRECTS names no redirect URI")
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> ServerSettings:
+        env = os.environ if env is None else env
+
+        def required(name: str) -> str:
+            value = env.get(name, "").strip()
+            if not value:
+                raise ConfigError(f"{name} is not set")
+            return value
+
+        def optional(name: str) -> str | None:
+            return env.get(name, "").strip() or None
+
+        redirects = env.get("FACTORY_BOARD_ALLOWED_REDIRECTS", CLAUDE_REDIRECT)
+        return cls(
+            base_url=required("FACTORY_BOARD_BASE_URL"),
+            oidc_config_url=required("FACTORY_BOARD_OIDC_CONFIG_URL"),
+            oidc_client_id=required("FACTORY_BOARD_OIDC_CLIENT_ID"),
+            oidc_client_secret=required("FACTORY_BOARD_OIDC_CLIENT_SECRET"),
+            jwt_signing_key=required("FACTORY_BOARD_JWT_SIGNING_KEY"),
+            storage_key=required("FACTORY_BOARD_STORAGE_KEY"),
+            operator_group=env.get("FACTORY_BOARD_OPERATOR_GROUP", "").strip()
+            or "factory-operators",
+            allowed_redirects=tuple(uri.strip() for uri in redirects.split(",") if uri.strip()),
+            route_header=required("FACTORY_BOARD_ROUTE_HEADER"),
+            session_token_sha256=optional("FACTORY_BOARD_SESSION_TOKEN_SHA256"),
+            nightly_token_sha256=optional("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256"),
+        )

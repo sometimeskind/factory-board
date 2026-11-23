@@ -31,7 +31,7 @@ in the server's code.
 | Role | Login | Is |
 |---|---|---|
 | `board_owner` | Yes | The owner of the database and the tables. The migrations run as it; the server never does |
-| `board_app` | Yes | The server's login. `NOINHERIT`: it can read and write nothing until it takes a tier |
+| `board_app` | Yes | The server's login. `NOINHERIT`: it can read and write no item until it takes a tier. As itself it has one table, the login proxy's (`oauth_proxy_kv`) |
 | `board_operator` | No | Tier: the operator |
 | `board_agent` | No | Tier: interactive sessions, and later the pipeline's runs |
 | `board_process` | No | Tier: the deterministic scripts |
@@ -80,6 +80,23 @@ the missing role's name if one is not there. For a throwaway database, a superus
 [`dev/roles.sql`](dev/roles.sql) first: it creates the five roles with fixed passwords and
 gives the database to `board_owner`.
 
+## Callers
+
+The tier belongs to the token (`factory_board/auth.py`), and is checked on every tool call.
+
+| Caller | Token | Identity | Tier |
+|---|---|---|---|
+| The operator, in claude.ai | A Pocket ID login in the operator group, through FastMCP's `OIDCProxy` | `human:<username>` | `board_operator` |
+| An interactive session | The session token, with the session's ID in the `X-Factory-Board-Session` header | `session:<id>` | `board_agent` |
+| The nightly | The nightly token | `process:nightly` | `board_process` |
+
+- A static token is accepted only when the route header is exactly `private`. The private
+  route must set that header and the public route must set it to `public`; a route that
+  passes the client's own value through gives every tier to whoever knows a token.
+- Every session holds the same token, so a session's ID is asserted, not proven.
+- `FACTORY_BOARD_DATABASE_URL` must be a URL (`postgresql://…`): the login proxy's store
+  connects with asyncpg, which takes no conninfo string.
+
 ## Settings
 
 | Variable | Meaning |
@@ -88,6 +105,16 @@ gives the database to `board_owner`.
 | `FACTORY_BOARD_MIGRATE_DATABASE_URL` | The same database as `board_owner`: what `migrate` connects with. The server does not need it |
 | `FACTORY_BOARD_MIGRATIONS_DIR` | Where the migrations are. Defaults to `migrations/` beside the package; the image sets `/app/migrations` |
 | `FACTORY_BOARD_TEST_DATABASE_URL` | Tests only: a superuser on a Postgres the tests may empty |
+| `FACTORY_BOARD_BASE_URL` | The server's public URL, as claude.ai reaches it |
+| `FACTORY_BOARD_OIDC_CONFIG_URL` | Pocket ID's discovery document |
+| `FACTORY_BOARD_OIDC_CLIENT_ID`, `FACTORY_BOARD_OIDC_CLIENT_SECRET` | The board's client in Pocket ID |
+| `FACTORY_BOARD_JWT_SIGNING_KEY` | Signs the tokens the login proxy issues |
+| `FACTORY_BOARD_STORAGE_KEY` | A Fernet key: the login proxy's rows are encrypted with it |
+| `FACTORY_BOARD_OPERATOR_GROUP` | The Pocket ID group that is the operator tier. Defaults to `factory-operators` |
+| `FACTORY_BOARD_ALLOWED_REDIRECTS` | Redirect URIs a client may register, comma-separated. Defaults to claude.ai's |
+| `FACTORY_BOARD_ROUTE_HEADER` | The header the routes set to `private` or `public`, overwriting the client's |
+| `FACTORY_BOARD_SESSION_TOKEN_SHA256` | The SHA-256 of the interactive sessions' token. Unset, that token is off |
+| `FACTORY_BOARD_NIGHTLY_TOKEN_SHA256` | The SHA-256 of the nightly's token. Unset, that token is off |
 
 `python -m factory_board migrate` applies the pending migrations and exits. A command asks
 only for the URL it needs, and fails by name when that one is missing.
