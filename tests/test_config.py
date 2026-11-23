@@ -100,6 +100,7 @@ SERVER_ENV = {
     "FACTORY_BOARD_JWT_SIGNING_KEY": "jwt-key",
     "FACTORY_BOARD_STORAGE_KEY": "storage-key",
     "FACTORY_BOARD_ROUTE_HEADER": "X-Board-Route",
+    "FACTORY_BOARD_OPERATOR": "olive",
 }
 
 
@@ -134,6 +135,8 @@ def test_each_server_setting_is_required(name: str) -> None:
         ),
         ({"FACTORY_BOARD_ROUTE_HEADER": "X Board Route"}, "not a header name"),
         ({"FACTORY_BOARD_ALLOWED_REDIRECTS": " , "}, "names no redirect URI"),
+        ({"FACTORY_BOARD_OPERATOR": "human:olive"}, "not a username"),
+        ({"FACTORY_BOARD_PORT": "http"}, "FACTORY_BOARD_PORT is not a number"),
     ],
 )
 def test_an_unusable_server_setting_is_refused(extra: dict[str, str], message: str) -> None:
