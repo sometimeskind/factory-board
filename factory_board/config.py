@@ -58,6 +58,7 @@ class Settings:
 
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_IDENTITY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
 _HEADER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,63}")
 
 CLAUDE_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
@@ -82,11 +83,20 @@ class ServerSettings:
     operator_group: str
     allowed_redirects: tuple[str, ...]
     route_header: str
+    # The operator's Pocket ID username: a new item for the operator is held by
+    # `human:<operator>`, whoever wrote it.
+    operator: str
     # Interactive sessions on pilot share one token; the nightly has its own.
     session_token_sha256: str | None = None
     nightly_token_sha256: str | None = None
+    # "" binds every address of both families (uvicorn makes "::" IPv6-only).
+    host: str = ""
+    port: int = 8000
+    metrics_port: int = 9090
 
     def __post_init__(self) -> None:
+        if not _IDENTITY_NAME.fullmatch(self.operator):
+            raise ConfigError("FACTORY_BOARD_OPERATOR is not a username")
         for name, value in (
             ("FACTORY_BOARD_SESSION_TOKEN_SHA256", self.session_token_sha256),
             ("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256", self.nightly_token_sha256),
@@ -116,6 +126,12 @@ class ServerSettings:
         def optional(name: str) -> str | None:
             return env.get(name, "").strip() or None
 
+        def port(name: str, default: int) -> int:
+            try:
+                return int(env.get(name, "").strip() or default)
+            except ValueError:
+                raise ConfigError(f"{name} is not a number") from None
+
         redirects = env.get("FACTORY_BOARD_ALLOWED_REDIRECTS", CLAUDE_REDIRECT)
         return cls(
             base_url=required("FACTORY_BOARD_BASE_URL"),
@@ -128,6 +144,9 @@ class ServerSettings:
             or "factory-operators",
             allowed_redirects=tuple(uri.strip() for uri in redirects.split(",") if uri.strip()),
             route_header=required("FACTORY_BOARD_ROUTE_HEADER"),
+            operator=required("FACTORY_BOARD_OPERATOR"),
+            port=port("FACTORY_BOARD_PORT", 8000),
+            metrics_port=port("FACTORY_BOARD_METRICS_PORT", 9090),
             session_token_sha256=optional("FACTORY_BOARD_SESSION_TOKEN_SHA256"),
             nightly_token_sha256=optional("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256"),
         )

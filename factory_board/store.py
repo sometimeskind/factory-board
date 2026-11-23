@@ -195,6 +195,29 @@ class Reply:
     body: str
 
 
+@dataclass(frozen=True)
+class OpenCount:
+    assignee: str
+    urgent: bool
+    deferred: bool
+    count: int
+    # When the oldest of them was created, in seconds since the epoch.
+    oldest_created: float
+
+
+@dataclass(frozen=True)
+class ClosedCount:
+    assignee: str
+    resolution: str
+    count: int
+
+
+@dataclass(frozen=True)
+class Stats:
+    open: tuple[OpenCount, ...]
+    closed: tuple[ClosedCount, ...]
+
+
 def new_item_id() -> str:
     return "".join(secrets.choice(ID_ALPHABET) for _ in range(ID_LENGTH))
 
@@ -522,6 +545,48 @@ class Store:
             raise ItemNotFound(f"no item {item_id}") from exc
         assert row is not None
         return _reply(row)
+
+    async def reply_and_close(self, caller: Caller, item_id: str, body: str) -> tuple[Reply, Item]:
+        """Add a reply and close the item as replied, in one transaction: both or neither."""
+        try:
+            async with self._as(caller) as conn:
+                cur = await conn.cursor(row_factory=dict_row).execute(
+                    "INSERT INTO replies (item_id, author, body) VALUES (%s, %s, %s) RETURNING *",
+                    (item_id, caller.identity, body),
+                )
+                row = await cur.fetchone()
+                assert row is not None
+                item = await self._update_open(
+                    conn,
+                    item_id,
+                    sql.SQL("closed_at = now(), resolution = %(resolution)s"),
+                    {"resolution": Resolution.REPLIED.value},
+                )
+        except errors.ForeignKeyViolation as exc:
+            raise ItemNotFound(f"no item {item_id}") from exc
+        return _reply(row), item
+
+    async def stats(self, caller: Caller) -> Stats:
+        """Counts for the metrics: the open items and the closed ones, and no item's text."""
+        async with self._as(caller) as conn:
+            cur = await conn.execute(
+                """
+                SELECT assignee, urgent, (not_before > now()) IS TRUE,
+                       count(*), min(extract(epoch FROM created_at))::float8
+                FROM items WHERE closed_at IS NULL
+                GROUP BY 1, 2, 3
+                """
+            )
+            open_items = [OpenCount(*row) for row in await cur.fetchall()]
+            cur = await conn.execute(
+                """
+                SELECT assignee, resolution, count(*)
+                FROM items WHERE closed_at IS NOT NULL
+                GROUP BY 1, 2
+                """
+            )
+            closed_items = [ClosedCount(*row) for row in await cur.fetchall()]
+        return Stats(tuple(open_items), tuple(closed_items))
 
     async def list_replies(self, caller: Caller, item_id: str) -> list[Reply]:
         """An item's replies, oldest first."""

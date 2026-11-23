@@ -97,6 +97,27 @@ The tier belongs to the token (`factory_board/auth.py`), and is checked on every
 - `FACTORY_BOARD_DATABASE_URL` must be a URL (`postgresql://…`): the login proxy's store
   connects with asyncpg, which takes no conninfo string.
 
+## Tools
+
+`python -m factory_board serve` serves the MCP at `/mcp`, `/healthz`, and the metrics on a
+port of their own. A tool outside the caller's row is refused.
+
+| Tier | Tools |
+|---|---|
+| Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump` |
+| Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
+| Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
+
+- `done`, `answer` and `defer` work on an item a person holds. `reply` closes such an item
+  as replied; on an item someone else holds it attaches the reply and leaves it open.
+  `reject` and `bump` work on any open item.
+- A session's item is held by `human:<operator>`; the nightly holds its keyed items.
+- Every create and verb logs `[BOARD] item=… kind=… verb=… actor=…`, with no item text.
+- The metrics are read from the database every 30 seconds: `factory_board_open_items` and
+  `factory_board_oldest_open_item_created_timestamp_seconds` (by assignee, urgent,
+  deferred), `factory_board_closed_items` (by assignee, resolution), and
+  `factory_board_tool_calls_total`.
+
 ## Settings
 
 | Variable | Meaning |
@@ -113,6 +134,8 @@ The tier belongs to the token (`factory_board/auth.py`), and is checked on every
 | `FACTORY_BOARD_OPERATOR_GROUP` | The Pocket ID group that is the operator tier. Defaults to `factory-operators` |
 | `FACTORY_BOARD_ALLOWED_REDIRECTS` | Redirect URIs a client may register, comma-separated. Defaults to claude.ai's |
 | `FACTORY_BOARD_ROUTE_HEADER` | The header the routes set to `private` or `public`, overwriting the client's |
+| `FACTORY_BOARD_OPERATOR` | The operator's Pocket ID username. A session's item for the operator is held by `human:<operator>` |
+| `FACTORY_BOARD_PORT`, `FACTORY_BOARD_METRICS_PORT` | The MCP's port (8000) and the metrics' (9090) |
 | `FACTORY_BOARD_SESSION_TOKEN_SHA256` | The SHA-256 of the interactive sessions' token. Unset, that token is off |
 | `FACTORY_BOARD_NIGHTLY_TOKEN_SHA256` | The SHA-256 of the nightly's token. Unset, that token is off |
 

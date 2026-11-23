@@ -114,6 +114,7 @@ def settings(issuer: str) -> ServerSettings:
         operator_group=GROUP,
         allowed_redirects=ALLOWED,
         route_header=ROUTE_HEADER,
+        operator="olive",
         session_token_sha256=sha256(SESSION_TOKEN),
         nightly_token_sha256=sha256(NIGHTLY_TOKEN),
     )

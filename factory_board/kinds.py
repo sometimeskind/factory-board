@@ -185,9 +185,10 @@ class _Model(BaseModel):
 
 
 class Subject(_Model):
-    """What an item is about: an issue, a PR, an alert or a finding, in a repo."""
+    """What an item is about: an issue or a PR in a repo, or an alert or a finding, which
+    may have no repo."""
 
-    repo: Repo
+    repo: Repo | None = None
     type: SubjectType
     ref: StrictInt | str
 
@@ -195,6 +196,8 @@ class Subject(_Model):
     def _ref_fits_type(self) -> Self:
         if self.type in (SubjectType.ISSUE, SubjectType.PR):
             _NUMBER.validate_python(self.ref)
+            if self.repo is None:
+                raise ValueError(f"an {self.type.value} subject needs a repo")
         else:
             _IDENTIFIER.validate_python(self.ref)
         return self
@@ -203,6 +206,8 @@ class Subject(_Model):
     def label(self) -> str:
         if isinstance(self.ref, int):
             return f"{self.type.value} {self.repo}#{self.ref}"
+        if self.repo is None:
+            return f"{self.type.value} {self.ref}"
         return f"{self.type.value} {self.repo} {self.ref}"
 
 
