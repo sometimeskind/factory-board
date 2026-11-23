@@ -51,6 +51,8 @@ jobs:
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
 
     env:
+      # The superuser: the fixtures create the roles from dev/roles.sql with it, then run
+      # the migrations as board_owner and the store as board_app.
       FACTORY_BOARD_TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/board_test
 
     steps:
@@ -131,9 +133,18 @@ jobs:
       - name: Image check — runs as non-root
         run: test "$(docker run --rm factory-board:ci-local id -u)" = 65532
 
-      - name: Image check — the shipped migrations apply, twice
+      # The migrations never create roles, so the superuser makes them first (dev/roles.sql,
+      # which also gives the database to board_owner). The image then migrates as board_owner.
+      - name: Create the roles
         env:
-          FACTORY_BOARD_DATABASE_URL: postgresql://postgres:test@localhost:5432/board_image
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: >-
+          docker exec -i "$POSTGRES_CONTAINER"
+          psql -q -v ON_ERROR_STOP=1 -U postgres -d board_image < dev/roles.sql
+
+      - name: Image check — the shipped migrations apply as board_owner, twice
+        env:
+          FACTORY_BOARD_MIGRATE_DATABASE_URL: postgresql://board_owner:board_owner@localhost:5432/board_image
         run: |
-          docker run --rm --network host --read-only -e FACTORY_BOARD_DATABASE_URL factory-board:ci-local
-          docker run --rm --network host --read-only -e FACTORY_BOARD_DATABASE_URL factory-board:ci-local
+          docker run --rm --network host --read-only -e FACTORY_BOARD_MIGRATE_DATABASE_URL factory-board:ci-local
+          docker run --rm --network host --read-only -e FACTORY_BOARD_MIGRATE_DATABASE_URL factory-board:ci-local
