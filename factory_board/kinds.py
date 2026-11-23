@@ -2,8 +2,9 @@
 
 An operator item is one model per kind, picked by its `kind` field. A typed kind renders
 its command from checked fields, so nothing a writer sends reaches a command line unchecked.
-Only `manual` carries a free-text command, and its rendering says so. The stage kinds are
-names only here; their models come with the stages.
+`manual` (a command) and `session` (a prompt) carry the writer's own text, which nothing
+checks, and their rendering says so. The stage kinds are names only here; their models come
+with the stages.
 
 Pure Python: no database, no MCP.
 """
@@ -460,12 +461,17 @@ class Decision(_OperatorItem):
 
 class Session(_OperatorItem):
     kind: Literal["session"] = "session"
-    # The prompt to start an interactive session with.
+    # The prompt to start an interactive session with. Shown as written: nothing checks
+    # it, so the rendering marks it as free text, like a `manual` command.
     prompt: CommandText
 
     def render(self, subject: Subject) -> Rendered:
         return self._rendered(
-            OperatorKind.SESSION, subject, machine=Machine.PILOT, commands=(self.prompt,)
+            OperatorKind.SESSION,
+            subject,
+            machine=Machine.PILOT,
+            commands=(self.prompt,),
+            free_text=True,
         )
 
 

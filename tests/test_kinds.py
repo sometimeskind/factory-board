@@ -534,8 +534,8 @@ def test_session() -> None:
     assert rendered.kind is OperatorKind.SESSION
     assert rendered.machine is Machine.PILOT
     assert rendered.commands == (prompt,)
-    assert rendered.free_text is False
-    assert rendered.confirmation == f"session for issue example/repo#101: {prompt}"
+    assert rendered.free_text is True
+    assert rendered.confirmation == f"session for issue example/repo#101: free text: {prompt}"
 
 
 def test_manual_is_marked_free_text() -> None:
@@ -550,16 +550,46 @@ def test_manual_is_marked_free_text() -> None:
     assert rendered.confirmation == f"manual for issue example/repo#101: free text: {command}"
 
 
-def test_only_manual_is_free_text() -> None:
-    others: list[dict[str, object]] = [
+def test_only_manual_and_session_are_free_text() -> None:
+    examples: list[dict[str, object]] = [
+        item("pr-approve", repo="example/repo", number=202, head_sha=SHA, machine="browser"),
         item("pr-merge", repo="example/repo", number=202, head_sha=SHA),
+        item(
+            "terraform-apply",
+            module="desec",
+            pr={"repo": "example/repo", "number": 202},
+            expected_plan="Nothing destroyed.",
+        ),
         kubectl(RESTART),
-        item("music-tool", tool="start_scan"),
+        item("music-tool", tool="start_scan", arguments={"album": "An Example"}),
         item("decision", options=["One.", "Two."]),
         item("session", prompt="Plan it."),
+        item("manual", command="widgetctl status", machine="pilot"),
     ]
-    for data in others:
-        assert parse_operator_item(data).render(ISSUE).free_text is False
+    assert [str(data["kind"]) for data in examples] == list(kinds.OPERATOR_KINDS)
+    for data in examples:
+        rendered = parse_operator_item(data).render(ISSUE)
+        unchecked = data["kind"] in ("session", "manual")
+        assert rendered.free_text is unchecked
+        assert ("free text: " in rendered.confirmation) is unchecked
+
+
+def test_the_summary_is_never_part_of_a_command() -> None:
+    marker = "MARKER-IN-THE-SUMMARY"
+    examples: list[dict[str, object]] = [
+        item("pr-approve", repo="example/repo", number=202, head_sha=SHA, machine="browser"),
+        item(
+            "terraform-apply",
+            module="desec",
+            pr={"repo": "example/repo", "number": 202},
+            expected_plan=marker,
+        ),
+        kubectl(RESTART, break_glass=True, break_glass_reason=marker),
+        item("decision", options=[f"{marker} one.", f"{marker} two."]),
+    ]
+    for data in examples:
+        rendered = parse_operator_item({**data, "summary": marker}).render(ISSUE)
+        assert marker not in rendered.model_dump_json()
 
 
 def test_manual_needs_a_known_machine() -> None:
