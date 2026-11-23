@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "factory-board"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "psycopg[binary]>=3.3.9,<4",
+]
+
+[project.scripts]
+factory-board = "factory_board.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["factory_board*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["factory_board", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
