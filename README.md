@@ -45,21 +45,34 @@ What each tier may do with a row (`migrations/0003_access.sql`):
 
 | Tier | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| `board_operator` | Every item and reply | Items and replies, as itself | Any open item | No |
-| `board_agent` | Every item and reply | Items, as itself | An open item that no `human:` or `process:` identity holds | No |
-| `board_process` | Every item and reply | Items, as itself | An open item it holds itself (`claimed_by` is its identity) | No |
+| `board_operator` | Every item and reply | Items and replies, as itself | Any open item: close, defer, bump | No |
+| `board_agent` | Every item and reply | Items, as itself and in its own run | An open item it holds itself: close | No |
+| `board_process` | Every item and reply | Items, as itself, never `operator_typed` | An open item it holds itself: close | No |
 
-- "As itself": `created_by`, or a reply's `author`, must equal `board.actor`. An agent may
-  create an item that the operator holds; that is how a session hands a step over.
-- An update covers the claim, the dates, `urgent`, `fields`, the result and the close. What an
-  item is (its ID, assignee, subject, kind, key and provenance) can't be rewritten by any tier.
+- "As itself": `created_by`, or a reply's `author`, must equal `board.actor`. For an agent,
+  `created_run` must be the ID in its identity. Whether the operator typed into the run
+  (`operator_typed`) is the agent's word, as its session ID is.
+- "Holds itself": `claimed_by` equals `board.actor`. An item nobody holds can be changed by
+  the operator only; claiming comes with a later build step.
+- A new item is open: no tier can insert a close, a result, a counted claim or a head SHA move.
+- An item for the operator is always held by a `human:` or `process:` identity (a CHECK), so
+  no agent can change it. A session hands a step over by creating an item the operator holds.
+- The grants are by column. Every tier may write `closed_at`, `resolution` and `result`; the
+  operator also `not_before` and `urgent`. Nothing else: not `fields`, not the claim, not what
+  the item is. A later step that writes another column brings its own grant.
 - A closed item is final: a trigger refuses every later change, except by the owner.
-- One exception to the holder rule: `set_pr_head_sha(item, head_sha)` lets an agent or a
-  process move the head SHA of an open `pr-approve` or `pr-merge` item that someone else
-  holds, and nothing else. It is the only `SECURITY DEFINER` function.
+- One exception to the holder rule: `set_pr_head_sha(item, repo, pr, head_sha)` lets an agent
+  or a process move the head SHA of an open `pr-approve` or `pr-merge` item that someone else
+  holds. The caller names the PR, and it must be the item's. Each move is appended to the
+  item's `head_sha_moves` (old SHA, new SHA, who, when), so the operator sees that the SHA
+  changed after the item was written. It is the only `SECURITY DEFINER` function and the only
+  way to change anything in `fields`.
 - Postgres refuses an `UPDATE` under these policies silently: no row changes and nothing is
   raised. The store checks the row count and raises `NotClaimHolder`, `ItemClosed` or
   `ItemNotFound`.
+- The database trusts `board.actor`, which the server sets. The server must take the caller,
+  and with it `created_by`, `created_run` and `operator_typed`, from the authenticated token
+  and never from a tool's input.
 
 **The migrations create no role.** In a cluster the roles are declared in the cluster's own
 configuration, where the database's owner can't create any. The first migration stops with
