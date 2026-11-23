@@ -157,8 +157,25 @@ def test_files_that_are_not_sql_are_ignored(tmp_path: Path) -> None:
     assert [m.label for m in discover(tmp_path)] == ["0001_widgets"]
 
 
-def test_shipped_migrations_apply_and_reapply(database_url: str) -> None:
-    """The repo's own migrations/ directory, as the image runs it."""
-    first = apply_migrations(database_url, DEFAULT_MIGRATIONS_DIR)
+def test_shipped_migrations_apply_and_reapply(owner_url: str) -> None:
+    """The repo's own migrations/ directory, as the image runs it: as board_owner."""
+    first = apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR)
     assert first == [m.label for m in discover(DEFAULT_MIGRATIONS_DIR)]
-    assert apply_migrations(database_url, DEFAULT_MIGRATIONS_DIR) == []
+    assert first[0] == "0001_items"
+    assert apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR) == []
+
+
+def test_shipped_migrations_name_a_missing_role(owner_url: str, conn: psycopg.Connection) -> None:
+    """The migrations never create a role, and say which one they miss."""
+    conn.execute("ALTER ROLE board_process RENAME TO board_process_away")
+    try:
+        with pytest.raises(MigrationError) as refused:
+            apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR)
+    finally:
+        conn.execute("ALTER ROLE board_process_away RENAME TO board_process")
+    message = str(refused.value)
+    assert "0001_items.sql failed" in message
+    assert "role board_process does not exist" in message
+    assert "dev/roles.sql" in message
+    assert not table_exists(conn, "items")
+    assert applied(conn) == []

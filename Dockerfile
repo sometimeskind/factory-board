@@ -27,6 +27,8 @@ RUN pip install --no-cache-dir -r /tmp/requirements-dev.txt
 COPY pyproject.toml /app/
 COPY factory_board/ /app/factory_board/
 COPY tests/ /app/tests/
+# The roles for a throwaway database; the tests apply them. Not in the production image.
+COPY dev/ /app/dev/
 ENV HOME=/tmp \
     PYTHONDONTWRITEBYTECODE=1
 USER 65532:65532
