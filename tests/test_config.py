@@ -11,25 +11,42 @@ from factory_board.__main__ import main
 from factory_board.config import DEFAULT_MIGRATIONS_DIR, ConfigError, Settings
 
 
-def test_database_url_is_required() -> None:
+def test_each_url_is_required_only_when_asked_for() -> None:
+    settings = Settings.from_env({})
     with pytest.raises(ConfigError, match="FACTORY_BOARD_DATABASE_URL is not set"):
-        Settings.from_env({})
+        settings.serve_url()
+    with pytest.raises(ConfigError, match="FACTORY_BOARD_MIGRATE_DATABASE_URL is not set"):
+        settings.migrate_url()
+
+
+def test_the_two_urls_are_separate() -> None:
+    settings = Settings.from_env(
+        {
+            "FACTORY_BOARD_DATABASE_URL": "postgresql://board_app@example/board",
+            "FACTORY_BOARD_MIGRATE_DATABASE_URL": "postgresql://board_owner@example/board",
+        }
+    )
+    assert settings.serve_url() == "postgresql://board_app@example/board"
+    assert settings.migrate_url() == "postgresql://board_owner@example/board"
+
+
+def test_migrate_does_not_need_the_serve_url() -> None:
+    settings = Settings.from_env(
+        {"FACTORY_BOARD_MIGRATE_DATABASE_URL": "postgresql://board_owner@example/board"}
+    )
+    assert settings.migrate_url() == "postgresql://board_owner@example/board"
+    with pytest.raises(ConfigError):
+        settings.serve_url()
 
 
 def test_migrations_dir_defaults_to_the_checkout() -> None:
-    settings = Settings.from_env({"FACTORY_BOARD_DATABASE_URL": "postgresql://example/board"})
-    assert settings.database_url == "postgresql://example/board"
+    settings = Settings.from_env({})
     assert settings.migrations_dir == DEFAULT_MIGRATIONS_DIR
     assert (settings.migrations_dir / "README.md").is_file()
 
 
 def test_migrations_dir_can_be_set() -> None:
-    settings = Settings.from_env(
-        {
-            "FACTORY_BOARD_DATABASE_URL": "postgresql://example/board",
-            "FACTORY_BOARD_MIGRATIONS_DIR": "/somewhere/else",
-        }
-    )
+    settings = Settings.from_env({"FACTORY_BOARD_MIGRATIONS_DIR": "/somewhere/else"})
     assert settings.migrations_dir == Path("/somewhere/else")
 
 
@@ -41,7 +58,7 @@ def test_migrate_command(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     (tmp_path / "0001_widgets.sql").write_text("CREATE TABLE widgets (id integer);")
-    monkeypatch.setenv("FACTORY_BOARD_DATABASE_URL", database_url)
+    monkeypatch.setenv("FACTORY_BOARD_MIGRATE_DATABASE_URL", database_url)
     monkeypatch.setenv("FACTORY_BOARD_MIGRATIONS_DIR", str(tmp_path))
 
     assert main(["migrate"]) == 0
@@ -58,7 +75,7 @@ def test_migrate_command_reports_a_refusal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     (tmp_path / "0002_widgets.sql").write_text("SELECT 1;")
-    monkeypatch.setenv("FACTORY_BOARD_DATABASE_URL", database_url)
+    monkeypatch.setenv("FACTORY_BOARD_MIGRATE_DATABASE_URL", database_url)
     monkeypatch.setenv("FACTORY_BOARD_MIGRATIONS_DIR", str(tmp_path))
 
     assert main(["migrate"]) == 1
@@ -68,6 +85,8 @@ def test_migrate_command_reports_a_refusal(
 def test_migrate_command_without_a_database_url(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.delenv("FACTORY_BOARD_DATABASE_URL", raising=False)
+    # The serve URL is no substitute: the migrations need the owner's.
+    monkeypatch.setenv("FACTORY_BOARD_DATABASE_URL", "postgresql://board_app@example/board")
+    monkeypatch.delenv("FACTORY_BOARD_MIGRATE_DATABASE_URL", raising=False)
     assert main(["migrate"]) == 1
-    assert "FACTORY_BOARD_DATABASE_URL is not set" in capsys.readouterr().err
+    assert "FACTORY_BOARD_MIGRATE_DATABASE_URL is not set" in capsys.readouterr().err

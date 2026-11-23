@@ -18,7 +18,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         settings = Settings.from_env()
-        applied = apply_migrations(settings.database_url, settings.migrations_dir)
+        applied = apply_migrations(settings.migrate_url(), settings.migrations_dir)
     except (ConfigError, MigrationError) as exc:
         print(f"factory-board: {exc}", file=sys.stderr)
         return 1
