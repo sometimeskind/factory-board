@@ -663,7 +663,6 @@ def test_strings_are_length_bounded() -> None:
 @pytest.mark.parametrize(
     "ticket",
     [
-        None,
         101,
         {"repo": "example/repo"},
         {"repo": "example/repo", "number": "101"},
@@ -678,8 +677,60 @@ def test_a_bad_ticket_is_refused(ticket: object) -> None:
     assert "ticket" in refused({**item("session", prompt="Plan it."), "ticket": ticket})
 
 
-def test_every_item_needs_a_ticket_and_a_summary() -> None:
-    assert "ticket" in refused({"kind": "session", "summary": "Why.", "prompt": "Plan it."})
+FINDING = Subject(repo="example/repo", type=SubjectType.FINDING, ref="docs:stale-note")
+
+
+def without_ticket(data: dict[str, object]) -> dict[str, object]:
+    return {name: value for name, value in data.items() if name != "ticket"}
+
+
+def test_an_item_needs_no_ticket() -> None:
+    examples: list[dict[str, object]] = [
+        item("pr-approve", repo="example/repo", number=202, head_sha=SHA, machine="browser"),
+        item("pr-merge", repo="example/repo", number=202, head_sha=SHA),
+        item(
+            "terraform-apply",
+            module="desec",
+            pr={"repo": "example/repo", "number": 202},
+            expected_plan="Nothing destroyed.",
+        ),
+        kubectl(RESTART),
+        item("music-tool", tool="start_scan"),
+        item("decision", options=["One.", "Two."]),
+        item("session", prompt="Plan it."),
+        item("manual", command="widgetctl status", machine="pilot"),
+    ]
+    assert [str(data["kind"]) for data in examples] == list(kinds.OPERATOR_KINDS)
+    for data in examples:
+        for bare in (without_ticket(data), {**data, "ticket": None}):
+            parsed = parse_operator_item(bare)
+            assert parsed.ticket is None
+            # The rendering is the same with or without a ticket.
+            assert parsed.render(FINDING) == parse_operator_item(data).render(FINDING)
+            assert "KUBECONFIG" not in parsed.render(FINDING).model_dump_json()
+            dumped = parsed.model_dump(mode="json")
+            assert dumped["ticket"] is None
+            assert parse_operator_item(dumped) == parsed
+
+
+def test_an_item_without_a_ticket_renders_its_subject_and_command() -> None:
+    parsed = parse_operator_item(without_ticket(kubectl(RESTART)))
+    rendered = parsed.render(FINDING)
+    assert rendered.machine is Machine.PHONE_VM
+    assert rendered.commands == ("kubectl rollout restart deployment/widget-api -n widgets",)
+    assert rendered.confirmation == (
+        "kubectl for finding example/repo docs:stale-note: "
+        "kubectl rollout restart deployment/widget-api -n widgets"
+    )
+    moved = parse_operator_item(
+        without_ticket(item("pr-merge", repo="example/repo", number=202, head_sha=SHA))
+    )
+    assert isinstance(moved, PrMerge)
+    assert moved.with_head_sha(OTHER_SHA).ticket is None
+
+
+def test_every_item_needs_a_summary() -> None:
+    assert "summary" in refused({"kind": "session", "prompt": "Plan it."})
     assert "summary" in refused(
         {"kind": "session", "ticket": {"repo": "example/repo", "number": 101}, "prompt": "Plan."}
     )

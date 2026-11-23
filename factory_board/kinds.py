@@ -247,7 +247,9 @@ class Rendered(_Model):
 
 
 class _OperatorItem(_Model):
-    ticket: Ticket
+    # The issue the item belongs to. None for an item with no issue, such as a finding
+    # that needs only the operator's hands; such an item has a key on its row instead.
+    ticket: Ticket | None = None
     # What the action does and why, in a sentence or two.
     summary: Prose
 
@@ -401,6 +403,8 @@ class Kubectl(_OperatorItem):
     kind: Literal["kubectl"] = "kubectl"
     action: KubectlAction
     # Set when the phone's admin can't run the command; it then runs on the workstation.
+    # The command is the same bare `kubectl …`, with no `KUBECONFIG=` prefix: the operator
+    # decided that the admin kubeconfig is the workstation's default.
     break_glass: StrictBool = False
     break_glass_reason: Prose | None = None
 
