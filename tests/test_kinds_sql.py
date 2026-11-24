@@ -12,11 +12,18 @@ from factory_board import kinds
 from factory_board.config import DEFAULT_MIGRATIONS_DIR
 
 ITEMS_SQL = (DEFAULT_MIGRATIONS_DIR / "0001_items.sql").read_text()
+# In the order they are applied, so the last file that defines a constraint is the live one.
+MIGRATIONS_SQL = [path.read_text() for path in sorted(DEFAULT_MIGRATIONS_DIR.glob("*.sql"))]
 
 
 def allowed(constraint: str) -> tuple[str, ...]:
-    """The quoted names in the one `IN (...)` list of a named CHECK constraint."""
-    found = re.findall(rf"CONSTRAINT {constraint}\s+CHECK \(\s*\w+ IN \(([^()]*)\)\s*\)", ITEMS_SQL)
+    """The quoted names in the one `IN (...)` list of a named CHECK constraint, as the last
+    migration that defines it leaves it.
+    """
+    pattern = rf"CONSTRAINT {constraint}\s+CHECK \(\s*\w+ IN \(([^()]*)\)\s*\)"
+    per_file = [found for sql in MIGRATIONS_SQL if (found := re.findall(pattern, sql))]
+    assert per_file, f"{constraint}: expected one `<column> IN (...)` check"
+    found = per_file[-1]
     assert len(found) == 1, f"{constraint}: expected one `<column> IN (...)` check"
     names = tuple(re.findall(r"'([^']*)'", found[0]))
     assert names, f"{constraint}: no names in the list"

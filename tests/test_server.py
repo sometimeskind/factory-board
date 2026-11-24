@@ -121,6 +121,14 @@ async def test_a_tool_outside_the_tier_s_row_is_refused(
     assert await store.list_open(OPERATOR, include_deferred=True) == []
 
 
+async def test_an_item_done_elsewhere_shows_its_place(board: Board) -> None:
+    elsewhere = MANUAL | {"machine": "other", "place": "widget press"}
+    item = (await board.call(AS_SESSION, "create_item", item=elsewhere))["item"]
+    assert (item["machine"], item["place"]) == ("other", "widget press")
+    plain = (await board.call(AS_SESSION, "create_item", item=MANUAL))["item"]
+    assert "place" not in plain
+
+
 async def test_a_session_s_item_is_held_by_the_operator_and_rendered(board: Board) -> None:
     created = await board.call(AS_SESSION, "create_item", item=MANUAL)
     item = created["item"]
