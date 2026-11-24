@@ -27,6 +27,7 @@ from factory_board.auth import Identity
 from factory_board.kinds import (
     Assess,
     AssessReason,
+    ClaimHash,
     Decision,
     DeployCheck,
     HeadSha,
@@ -36,8 +37,10 @@ from factory_board.kinds import (
     OperatorItem,
     PrApprove,
     PrMerge,
+    ReleaseReason,
     Rendered,
     Repo,
+    RunId,
     StageItem,
     SubjectType,
     parse_operator_item,
@@ -45,6 +48,7 @@ from factory_board.kinds import (
 from factory_board.kinds import Subject as KindSubject
 from factory_board.store import (
     MAX_AFTER,
+    Claim,
     Created,
     Item,
     NewItem,
@@ -74,8 +78,9 @@ command was run), answer (a decision), reply (free text), defer (hide until a da
 ("not doing this", with a reason) and bump (make it urgent). A session creates items for the
 operator and reads them. The nightly creates keyed items, reads the replies on its own and
 closes its own. The reconciler writes the items that follow from what GitHub shows, for the
-pipeline's stages and for the operator, and closes them when the fact goes away. A tool
-outside the caller's tier is refused.
+pipeline's stages and for the operator, and closes them when the fact goes away. The
+dispatcher reads the queue of the stages' items, claims one for each run it starts and
+releases a claim when a run is interrupted. A tool outside the caller's tier is refused.
 
 Every verb takes the item's ID, never a position in a list, and answers with a confirmation
 that repeats the item's subject and command: show it to the operator. A closed item stays
@@ -115,8 +120,9 @@ OPERATOR = frozenset({"operator"})
 SESSION = frozenset({"session"})
 NIGHTLY = frozenset({"nightly"})
 RECONCILER = frozenset({"reconciler"})
+DISPATCHER = frozenset({"dispatcher"})
 READERS = OPERATOR | SESSION
-EVERY_READER = READERS | RECONCILER
+EVERY_READER = READERS | RECONCILER | DISPATCHER
 
 
 def who(identity: Identity) -> str:
@@ -169,7 +175,29 @@ def _confirmation(item: Item) -> str:
     return shown[1].confirmation
 
 
-def view(item: Item, replies: list[Reply] | None = None) -> dict[str, Any]:
+def claim_view(claim: Claim) -> dict[str, Any]:
+    """A claim as a tool returns it. `ending` is None while the run goes on."""
+    out: dict[str, Any] = {
+        "run": claim.run,
+        "item": claim.item_id,
+        "stage": claim.stage,
+        "urgent": claim.urgent,
+        "claimed_at": _iso(claim.claimed_at),
+        "expires": _iso(claim.expires_at),
+        "ending": claim.ending,
+    }
+    if claim.ended_at is not None:
+        out["ended_at"] = _iso(claim.ended_at)
+    if claim.reason is not None:
+        out["reason"] = claim.reason
+    if claim.decision_id is not None:
+        out["decision"] = claim.decision_id
+    return out
+
+
+def view(
+    item: Item, replies: list[Reply] | None = None, claims: list[Claim] | None = None
+) -> dict[str, Any]:
     """An item as a tool returns it."""
     out: dict[str, Any] = {
         "id": item.id,
@@ -193,6 +221,12 @@ def view(item: Item, replies: list[Reply] | None = None) -> dict[str, Any]:
             out["reasons"] = list(item.reasons)
         if item.input_hash is not None:
             out["input_hash"] = item.input_hash
+        if item.claim_expires is not None:
+            out["claim_expires"] = _iso(item.claim_expires)
+        if item.expiries:
+            out["expiries"] = item.expiries
+        if item.releases:
+            out["releases"] = item.releases
     else:
         parsed, rendered = shown
         out |= {
@@ -226,6 +260,8 @@ def view(item: Item, replies: list[Reply] | None = None) -> dict[str, Any]:
             {"author": reply.author, "at": _iso(reply.created_at), "text": reply.body}
             for reply in replies
         ]
+    if claims:
+        out["claims"] = [claim_view(claim) for claim in claims]
     return out
 
 
@@ -373,11 +409,16 @@ def build_server(
         return await call("list_items", READERS, run)
 
     async def get_item(item_id: ItemId) -> dict[str, Any]:
-        """One item, open or closed, with the operator's replies on it."""
+        """One item, open or closed, with the operator's replies on it, and for a stage's
+        item the runs that claimed it."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             item = await store.get_item(identity.caller, item_id)
-            return view(item, await store.list_replies(identity.caller, item_id))
+            return view(
+                item,
+                await store.list_replies(identity.caller, item_id),
+                await store.list_claims(identity.caller, item_id),
+            )
 
         return await call("get_item", EVERY_READER, run)
 
@@ -456,9 +497,17 @@ def build_server(
                 result = {"answer": text}
             closed = await store.close_item(identity.caller, item_id, Resolution.ANSWERED, result)
             record("answer", closed, identity)
+            # A decision written after two expired claims closes its item with it, unless
+            # the first option ("try again") was chosen.
+            also = await store.list_cascaded(identity.caller, closed.id)
+            for item in also:
+                record("cascade", item, identity)
             return {
                 "status": "answered",
                 "confirmation": f"{_confirmation(closed)}: {result['answer']}",
+                "also_closed": [
+                    {"id": item.id, "confirmation": _confirmation(item)} for item in also
+                ],
             }
 
         return await call("answer", OPERATOR, run)
@@ -760,6 +809,105 @@ def build_server(
 
         return await call("close_for_fact", RECONCILER, run)
 
+    # ---- the dispatcher ----
+
+    async def list_claimable() -> dict[str, Any]:
+        """The queue, in the order to take it: first the claims that ran out are counted
+        (`expired`, each with the decision item written when it was the second in a row),
+        then `items` lists every stage's item a run may be started on, with its rank (1 is
+        anything urgent, then health, digest, review, deploy-check, assess, work, retro) and
+        the oldest first within a rank. `last_claims` are the two claims made last, newest
+        first, for the rule that alternates assess and work."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            expired = await store.expire_claims(identity.caller, operator_identity)
+            for entry in expired:
+                log.info(
+                    "[BOARD] item=%s verb=expire run=%s decision=%s actor=%s",
+                    entry.item_id,
+                    entry.run,
+                    entry.decision_id or "-",
+                    identity.caller.identity,
+                )
+            claimable = await store.list_claimable(identity.caller)
+            last = await store.last_claims(identity.caller)
+            return {
+                "expired": [
+                    {"item": entry.item_id, "run": entry.run, "decision": entry.decision_id}
+                    for entry in expired
+                ],
+                "items": [view(entry.item) | {"rank": entry.rank} for entry in claimable],
+                "last_claims": [claim_view(claim) for claim in last],
+            }
+
+        return await call("list_claimable", DISPATCHER, run)
+
+    async def claim(
+        item_id: ItemId,
+        run_id: RunId,
+        cap_minutes: Annotated[
+            int,
+            Field(ge=1, le=1440, description="the stage's time cap; the claim runs out 10 min on"),
+        ],
+        input_hash: Annotated[
+            ClaimHash | None,
+            Field(
+                description="the issue's current staleness hash: for an assess item on an "
+                "issue, and for a work item that carries one"
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Claim a stage's item for one run, which then holds it as run:<run_id>. Answers
+        with the run's token, once: the board keeps only its hash, and the token is dead
+        when the item closes or the claim ends. An assess item is stamped with input_hash.
+        A work item assessed under another hash is closed as superseded instead, with status
+        "stale" and no token: start nothing. A run ID claims once."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            claimed = await store.claim_item(
+                identity.caller, item_id, run_id, cap_minutes, input_hash
+            )
+            if claimed.stale:
+                record("stale", claimed.item, identity)
+                return {
+                    "status": "stale",
+                    "confirmation": _confirmation(claimed.item),
+                    "item": view(claimed.item),
+                }
+            record("claim", claimed.item, identity)
+            return {
+                "status": "claimed",
+                "confirmation": _confirmation(claimed.item),
+                "token": claimed.token,
+                "item": view(claimed.item),
+            }
+
+        return await call("claim", DISPATCHER, run)
+
+    async def release(
+        item_id: ItemId,
+        reason: ReleaseReason,
+        not_before: Annotated[
+            datetime | None,
+            Field(
+                description="for a deploy-check only: when it returns to the queue, at most a "
+                "day ahead, with its UTC offset"
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Give a run's claim back after a known interruption: the item returns to the queue
+        at once, the release is counted on it, and it does not count as an expiry. A claim
+        that has already run out is not released; it expires."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            if not_before is not None and not_before.tzinfo is None:
+                raise ToolError("not_before needs a UTC offset, e.g. 2026-01-31T08:00:00+00:00")
+            item = await store.release_claim(identity.caller, item_id, reason.value, not_before)
+            record("release", item, identity)
+            return {"status": "released", "confirmation": _confirmation(item), "item": view(item)}
+
+        return await call("release", DISPATCHER, run)
+
     read_only = {"readOnlyHint": True}
     write = {"destructiveHint": False}
     final = {"destructiveHint": True}
@@ -772,6 +920,9 @@ def build_server(
         (write_stage_item, write),
         (write_operator_item, write),
         (close_for_fact, final),
+        (list_claimable, write),
+        (claim, write),
+        (release, write),
         (done, final),
         (answer, final),
         (reply, final),

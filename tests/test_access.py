@@ -660,10 +660,17 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
         "SELECT proname FROM pg_proc WHERE prosecdef AND pronamespace = 'public'::regnamespace "
         "ORDER BY proname"
     ).fetchall()
-    # The other one is a trigger's function, which nobody can call (the cascade, below).
+    # Three are triggers' functions, which nobody can call (the cascade, below, and the two
+    # of the claims); the claims' own are pinned in test_claims_sql.py.
     assert definers == [
+        ("claim_item",),
+        ("claims_end_on_close",),
+        ("expire_claims",),
         ("items_cascade_close",),
+        ("items_stop_after_expiries",),
         ("merge_assess_trigger",),
+        ("release_claim",),
+        ("run_of_token",),
         ("set_pr_head_sha",),
     ]
 

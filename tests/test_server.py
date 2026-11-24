@@ -5,6 +5,8 @@ Every repo, number, name and command here is invented.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -12,7 +14,7 @@ from typing import Any
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from helpers import NIGHTLY, OPERATOR, RECONCILER, REPO, RUN, SESSION, SHA_A, SHA_B
+from helpers import DISPATCHER, NIGHTLY, OPERATOR, RECONCILER, REPO, RUN, SESSION, SHA_A, SHA_B
 from prometheus_client import REGISTRY
 
 from factory_board import metrics
@@ -24,6 +26,7 @@ AS_OPERATOR = Identity(OPERATOR, operator_typed=True)
 AS_SESSION = Identity(SESSION, operator_typed=True)
 AS_NIGHTLY = Identity(NIGHTLY, operator_typed=False)
 AS_RECONCILER = Identity(RECONCILER, operator_typed=False)
+AS_DISPATCHER = Identity(DISPATCHER, operator_typed=False)
 
 TICKET = {"repo": REPO, "number": 101}
 MANUAL: dict[str, Any] = {
@@ -70,6 +73,7 @@ TOOLS = {
     "session": {"create_item", "list_items", "update_pr_head"} | READS,
     "nightly": {"create_keyed_item", "list_own_items", "close_own_item"},
     "reconciler": {"write_stage_item", "write_operator_item", "close_for_fact"} | READS,
+    "dispatcher": {"list_claimable", "claim", "release"} | READS,
 }
 AHEAD = (datetime.now(UTC) + timedelta(days=2)).isoformat()
 # One call per tool that passes validation; the ID names no item.
@@ -92,6 +96,9 @@ CALLS: dict[str, dict[str, Any]] = {
     "write_stage_item": {"item": ASSESS},
     "write_operator_item": {"item": PR_APPROVE},
     "close_for_fact": {"item_id": "abcdefgh", "cause": "merged"},
+    "list_claimable": {},
+    "claim": {"item_id": "abcdefgh", "run_id": "20260101-review-01", "cap_minutes": 30},
+    "release": {"item_id": "abcdefgh", "reason": "stopped"},
 }
 
 
@@ -128,7 +135,9 @@ async def test_the_tools_are_the_three_rows(board: Board) -> None:
     assert names == set().union(*TOOLS.values()) == set(CALLS)
 
 
-@pytest.mark.parametrize("identity", [AS_OPERATOR, AS_SESSION, AS_NIGHTLY, AS_RECONCILER])
+@pytest.mark.parametrize(
+    "identity", [AS_OPERATOR, AS_SESSION, AS_NIGHTLY, AS_RECONCILER, AS_DISPATCHER]
+)
 async def test_a_tool_outside_the_tier_s_row_is_refused(
     board: Board, store: Store, identity: Identity
 ) -> None:
@@ -707,3 +716,422 @@ async def test_the_last_assessment_of_each_issue(board: Board, conn: Any) -> Non
     listed = (await board.call(AS_SESSION, "list_assessments", repo=REPO))["items"]
     assert [(entry["id"], entry["input_hash"]) for entry in listed] == [(ids[1], "h2")]
     assert listed[0]["result"] == {"outcome": "none"}
+
+
+# ---- the dispatcher ----
+
+WORK: dict[str, Any] = {
+    "kind": "work",
+    "repo": REPO,
+    "number": 203,
+    "head_sha": SHA_A,
+    "cause": "conflict",
+}
+REVIEW_LABEL = f"review for pr {REPO}#202"
+
+
+async def staged(board: Board, item: dict[str, Any], **arguments: Any) -> str:
+    """A stage's item, as the reconciler writes it; its ID."""
+    created = await board.call(AS_RECONCILER, "write_stage_item", item=item, **arguments)
+    assert created["status"] == "created", created
+    return created["item"]["id"]
+
+
+async def claim(board: Board, item_id: str, run_id: str, **arguments: Any) -> dict[str, Any]:
+    return await board.call(
+        AS_DISPATCHER, "claim", item_id=item_id, run_id=run_id, cap_minutes=30, **arguments
+    )
+
+
+async def queue(board: Board) -> dict[str, Any]:
+    return await board.call(AS_DISPATCHER, "list_claimable")
+
+
+def lapse(conn: Any, item_id: str) -> None:
+    """Move time: the item's running claim ran out a minute ago."""
+    conn.execute(
+        "UPDATE items SET claim_expires = now() - interval '1 minute' WHERE id = %s", (item_id,)
+    )
+    conn.execute(
+        "UPDATE claims SET expires_at = now() - interval '1 minute' "
+        "WHERE item_id = %s AND ended_at IS NULL",
+        (item_id,),
+    )
+
+
+async def run_out(board: Board, conn: Any, item_id: str, run_id: str) -> str | None:
+    """One claim that runs out and is counted by the next read of the queue; the decision
+    item, if one was written."""
+    await claim(board, item_id, run_id)
+    lapse(conn, item_id)
+    expired = (await queue(board))["expired"]
+    assert [(entry["item"], entry["run"]) for entry in expired] == [(item_id, run_id)]
+    return expired[0]["decision"]
+
+
+async def test_the_three_processes_do_not_share_their_tools(board: Board) -> None:
+    assert who(AS_DISPATCHER) == "dispatcher"
+    item_id = await staged(board, REVIEW)
+    for identity in (AS_RECONCILER, AS_NIGHTLY, AS_SESSION, AS_OPERATOR):
+        with pytest.raises(ToolError, match="not a tool of this caller's tier"):
+            await board.call(identity, "claim", item_id=item_id, run_id="r1", cap_minutes=30)
+    with pytest.raises(ToolError, match="not a tool of this caller's tier"):
+        await board.call(AS_DISPATCHER, "close_for_fact", item_id=item_id, cause="merged")
+    # It reads what the reconciler reads.
+    assert [entry["id"] for entry in await pipeline(board)] == [item_id]
+    listed = await board.call(AS_DISPATCHER, "list_pipeline_items")
+    assert [entry["id"] for entry in listed["items"]] == [item_id]
+    assert (await board.call(AS_DISPATCHER, "list_assessments", repo=REPO))["items"] == []
+
+
+async def test_the_queue_lists_what_ran_out_the_items_and_the_last_claims(
+    board: Board, conn: Any
+) -> None:
+    assert await queue(board) == {"expired": [], "items": [], "last_claims": []}
+    review = await staged(board, REVIEW)
+    assess = await staged(board, ASSESS)
+    check = await staged(board, DEPLOY_CHECK, urgent=True)
+    await staged(board, {"kind": "merge", "repo": REPO, "number": 204, "head_sha": SHA_A})
+    await board.create(MANUAL)
+
+    listed = await queue(board)
+    assert (listed["expired"], listed["last_claims"]) == ([], [])
+    assert [(entry["id"], entry["rank"]) for entry in listed["items"]] == [
+        (check, 1),
+        (review, 4),
+        (assess, 6),
+    ]
+    # An item as every list shows it, with its place in the order.
+    shown = await board.call(AS_DISPATCHER, "get_item", item_id=review)
+    assert listed["items"][1] == {k: v for k, v in shown.items() if k != "replies"} | {"rank": 4}
+
+    await claim(board, review, "20260101-review-01")
+    await claim(board, assess, "20260101-assess-01", input_hash="h1")
+    listed = await queue(board)
+    assert [entry["id"] for entry in listed["items"]] == [check]
+    last = listed["last_claims"]
+    assert [(c["run"], c["item"], c["stage"], c["urgent"], c["ending"]) for c in last] == [
+        ("20260101-assess-01", assess, "assess", False, None),
+        ("20260101-review-01", review, "review", False, None),
+    ]
+    assert set(last[0]) == {"run", "item", "stage", "urgent", "claimed_at", "expires", "ending"}
+
+    # The claims that ran out are counted before the queue is read.
+    lapse(conn, review)
+    listed = await queue(board)
+    assert listed["expired"] == [{"item": review, "run": "20260101-review-01", "decision": None}]
+    assert [(entry["id"], entry.get("expiries")) for entry in listed["items"]] == [
+        (check, None),
+        (review, 1),
+    ]
+    assert [(c["run"], c["ending"]) for c in listed["last_claims"]] == [
+        ("20260101-assess-01", None),
+        ("20260101-review-01", "expired"),
+    ]
+    assert (await queue(board))["expired"] == []
+
+
+async def test_a_claim_answers_with_the_run_s_token_once(
+    board: Board, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    item_id = await staged(board, REVIEW)
+    claimed = await board.call(
+        AS_DISPATCHER, "claim", item_id=item_id, run_id="20260101-review-01", cap_minutes=45
+    )
+    assert (claimed["status"], claimed["confirmation"]) == ("claimed", REVIEW_LABEL)
+    token = claimed["token"]
+    assert isinstance(token, str) and len(token) >= 43
+    assert claimed["item"]["held_by"] == "run:20260101-review-01"
+    ends = datetime.fromisoformat(claimed["item"]["claim_expires"])
+    assert abs(ends - datetime.now(UTC) - timedelta(minutes=55)) < timedelta(minutes=1)
+
+    hashed = hashlib.sha256(token.encode()).hexdigest()
+    for reader in (AS_DISPATCHER, AS_RECONCILER, AS_SESSION, AS_OPERATOR):
+        shown = await board.call(reader, "get_item", item_id=item_id)
+        assert shown["held_by"] == "run:20260101-review-01"
+        assert shown["claim_expires"] == claimed["item"]["claim_expires"]
+        assert shown["claims"] == [
+            {
+                "run": "20260101-review-01",
+                "item": item_id,
+                "stage": "review",
+                "urgent": False,
+                "claimed_at": shown["claims"][0]["claimed_at"],
+                "expires": shown["claim_expires"],
+                "ending": None,
+            }
+        ]
+        # The token was the claim's answer and is nowhere else: not on the item ...
+        assert token not in json.dumps(shown) and hashed not in json.dumps(shown)
+    listed = await queue(board)
+    assert token not in json.dumps(listed) and hashed not in json.dumps(listed)
+    # ... and not in the log, which has one line for the claim.
+    assert token not in caplog.text and hashed not in caplog.text
+    lines = [r.getMessage() for r in caplog.records if r.name == "factory_board.server"]
+    assert lines == [
+        f"[BOARD] item={item_id} kind=review verb=create actor={RECONCILER.identity}",
+        f"[BOARD] item={item_id} kind=review verb=claim actor={DISPATCHER.identity}",
+    ]
+
+    with pytest.raises(ToolError, match="is not claimable: it is held by run:20260101-review-01"):
+        await claim(board, item_id, "20260101-review-02")
+    other = await staged(board, REVIEW | {"number": 205})
+    with pytest.raises(ToolError, match="has claimed before"):
+        await claim(board, other, "20260101-review-01")
+    with pytest.raises(ToolError, match="no item abcdefgh to claim"):
+        await claim(board, "abcdefgh", "20260101-review-02")
+    again = await claim(board, other, "20260101-review-02")
+    assert again["token"] != token
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"run_id": "not a run"},
+        {"run_id": ""},
+        {"run_id": "run:20260101-review-01"},
+        {"cap_minutes": 0},
+        {"cap_minutes": 1441},
+        {"cap_minutes": "long"},
+        {"input_hash": "has space"},
+        {"input_hash": ""},
+        {"token": "mine"},
+        {"claimed_by": "run:20260101-review-09"},
+    ],
+)
+async def test_a_claim_is_checked(board: Board, bad: dict[str, Any]) -> None:
+    item_id = await staged(board, ASSESS)
+    arguments = {"item_id": item_id, "run_id": "20260101-assess-01", "cap_minutes": 30} | bad
+    with pytest.raises(ToolError):
+        await board.call(AS_DISPATCHER, "claim", **arguments)
+    assert (await board.call(AS_DISPATCHER, "get_item", item_id=item_id))["held_by"] is None
+
+
+async def test_a_stale_work_item_is_closed_and_nothing_is_claimed(
+    board: Board, conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    assess = await staged(board, ASSESS)
+    with pytest.raises(ToolError, match="claimed with the issue's hash"):
+        await claim(board, assess, "20260101-assess-01")
+    stamped = await claim(board, assess, "20260101-assess-01", input_hash="h2")
+    assert (stamped["status"], stamped["item"]["input_hash"]) == ("claimed", "h2")
+
+    work = await staged(board, WORK)
+    conn.execute("UPDATE items SET input_hash = 'h1' WHERE id = %s", (work,))
+    caplog.set_level(logging.INFO, logger="factory_board.server")
+    stale = await claim(board, work, "20260101-work-01", input_hash="h2")
+    assert (stale["status"], stale["confirmation"]) == ("stale", f"work for pr {REPO}#203")
+    assert "token" not in stale
+    item = stale["item"]
+    assert (item["open"], item["resolution"], item["held_by"]) == (False, "superseded", None)
+    assert item["result"] == {"cause": "stale", "input_hash": "h2"}
+    lines = [r.getMessage() for r in caplog.records if r.name == "factory_board.server"]
+    assert lines == [f"[BOARD] item={work} kind=work verb=stale actor={DISPATCHER.identity}"]
+    shown = await board.call(AS_DISPATCHER, "get_item", item_id=work)
+    assert "claims" not in shown and "claim_expires" not in shown
+    listed = await queue(board)
+    assert [c["run"] for c in listed["last_claims"]] == ["20260101-assess-01"]
+    assert listed["items"] == []
+
+    # Under the hash it was assessed with, it is claimed.
+    fresh = await staged(board, WORK)
+    conn.execute("UPDATE items SET input_hash = 'h1' WHERE id = %s", (fresh,))
+    claimed = await claim(board, fresh, "20260101-work-02", input_hash="h1")
+    assert (claimed["status"], claimed["item"]["input_hash"]) == ("claimed", "h1")
+    assert "token" in claimed
+
+
+async def test_a_release_takes_one_of_five_reasons(
+    board: Board, caplog: pytest.LogCaptureFixture
+) -> None:
+    item_id = await staged(board, REVIEW)
+    reasons = ["start-failed", "infra-window", "usage-limit", "stopped", "not-live"]
+    caplog.set_level(logging.INFO, logger="factory_board.server")
+    for count, reason in enumerate(reasons, start=1):
+        await claim(board, item_id, f"20260101-review-0{count}")
+        released = await board.call(AS_DISPATCHER, "release", item_id=item_id, reason=reason)
+        assert (released["status"], released["confirmation"]) == ("released", REVIEW_LABEL)
+        item = released["item"]
+        assert (item["held_by"], item["releases"], item["open"]) == (None, count, True)
+        assert "claim_expires" not in item and "expiries" not in item
+        # Back in the queue at once.
+        assert [entry["id"] for entry in (await queue(board))["items"]] == [item_id]
+    assert [record.getMessage().split()[3] for record in caplog.records] == [
+        "verb=claim",
+        "verb=release",
+    ] * 5
+
+    await claim(board, item_id, "20260101-review-06")
+    for bad in ("bored", "Stopped", "", "expired"):
+        with pytest.raises(ToolError):
+            await board.call(AS_DISPATCHER, "release", item_id=item_id, reason=bad)
+    shown = await board.call(AS_OPERATOR, "get_item", item_id=item_id)
+    assert shown["held_by"] == "run:20260101-review-06"
+    assert [(c["ending"], c.get("reason")) for c in shown["claims"]] == [
+        *[("released", reason) for reason in reasons],
+        (None, None),
+    ]
+    assert all("ended_at" in c for c in shown["claims"][:5])
+    assert "ended_at" not in shown["claims"][5]
+
+
+async def test_a_release_of_what_no_run_holds_is_refused(board: Board, conn: Any) -> None:
+    item_id = await staged(board, REVIEW)
+    with pytest.raises(ToolError, match="held by nobody, not by a run"):
+        await board.call(AS_DISPATCHER, "release", item_id=item_id, reason="stopped")
+    with pytest.raises(ToolError, match="no item abcdefgh"):
+        await board.call(AS_DISPATCHER, "release", item_id="abcdefgh", reason="stopped")
+    # A claim that ran out is not given back: it expires.
+    await claim(board, item_id, "20260101-review-01")
+    lapse(conn, item_id)
+    with pytest.raises(ToolError, match="has run out; it can only expire"):
+        await board.call(AS_DISPATCHER, "release", item_id=item_id, reason="stopped")
+    assert (await queue(board))["expired"][0]["item"] == item_id
+
+
+async def test_a_deploy_check_is_released_until_a_time(board: Board) -> None:
+    check = await staged(board, DEPLOY_CHECK)
+    review = await staged(board, REVIEW)
+    await claim(board, check, "20260101-deploy-check-01")
+    await claim(board, review, "20260101-review-01")
+    soon = datetime.now(UTC) + timedelta(hours=2)
+
+    async def release(item_id: str, not_before: str) -> dict[str, Any]:
+        return await board.call(
+            AS_DISPATCHER, "release", item_id=item_id, reason="not-live", not_before=not_before
+        )
+
+    with pytest.raises(ToolError, match="not_before needs a UTC offset"):
+        await release(check, soon.replace(tzinfo=None).isoformat())
+    with pytest.raises(ToolError, match="only a deploy-check"):
+        await release(review, soon.isoformat())
+    for bad in (timedelta(hours=-1), timedelta(hours=25)):
+        with pytest.raises(ToolError, match="at most a day ahead"):
+            await release(check, (datetime.now(UTC) + bad).isoformat())
+    for item_id in (check, review):
+        assert (await board.call(AS_DISPATCHER, "get_item", item_id=item_id))["held_by"]
+
+    released = await release(check, soon.isoformat())
+    item = released["item"]
+    assert (item["held_by"], item["releases"]) == (None, 1)
+    assert datetime.fromisoformat(item["deferred_until"]) == soon
+    assert (await queue(board))["items"] == []
+    shown = await board.call(AS_RECONCILER, "get_item", item_id=check)
+    assert [(c["ending"], c["reason"]) for c in shown["claims"]] == [("released", "not-live")]
+
+
+async def twice_run_out(board: Board, conn: Any) -> tuple[str, str]:
+    """A review item whose claim ran out twice in a row, and the decision written for it."""
+    item_id = await staged(board, REVIEW)
+    assert await run_out(board, conn, item_id, "20260101-review-01") is None
+    decision = await run_out(board, conn, item_id, "20260101-review-02")
+    assert decision is not None
+    return item_id, decision
+
+
+async def test_two_expiries_in_a_row_ask_the_operator(
+    board: Board, conn: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="factory_board.server")
+    item_id, decision = await twice_run_out(board, conn)
+    lines = [record.getMessage() for record in caplog.records if "verb=expire" in record.message]
+    actor = f"actor={DISPATCHER.identity}"
+    assert lines == [
+        f"[BOARD] item={item_id} verb=expire run=20260101-review-01 decision=- {actor}",
+        f"[BOARD] item={item_id} verb=expire run=20260101-review-02 decision={decision} {actor}",
+    ]
+
+    listed = (await board.call(AS_OPERATOR, "list_items"))["items"]
+    assert [entry["id"] for entry in listed] == [decision]
+    asked = listed[0]
+    assert (asked["kind"], asked["subject"], asked["urgent"]) == (
+        "decision",
+        f"pr {REPO}#202",
+        False,
+    )
+    assert (asked["held_by"], asked["created_by"]) == (OPERATOR.identity, DISPATCHER.identity)
+    assert asked["operator_typed"] is False
+    assert len(asked["fields"]["options"]) == 2
+    for named in ("review", item_id, "20260101-review-01", "20260101-review-02"):
+        assert named in asked["summary"]
+
+    # The item waits on the decision: it is in no queue, and no run is started on it.
+    waiting = await board.call(AS_DISPATCHER, "get_item", item_id=item_id)
+    assert (waiting["open"], waiting["held_by"], waiting["expiries"]) == (True, None, 2)
+    assert waiting["waiting_on"] == [decision]
+    assert [(c["run"], c["ending"], c["decision"]) for c in waiting["claims"]] == [
+        ("20260101-review-01", "expired", decision),
+        ("20260101-review-02", "expired", decision),
+    ]
+    assert await queue(board) == {
+        "expired": [],
+        "items": [],
+        "last_claims": (await queue(board))["last_claims"],
+    }
+    with pytest.raises(ToolError, match="is not claimable"):
+        await claim(board, item_id, "20260101-review-03")
+
+
+@pytest.mark.parametrize(
+    ("given", "answer"),
+    [
+        ({"option": 2}, "Stop: close the item as superseded"),
+        ({"text": "sell the press"}, "sell the press"),
+    ],
+    ids=["stop", "own-text"],
+)
+async def test_any_answer_but_try_again_closes_the_item_with_the_decision(
+    board: Board, conn: Any, caplog: pytest.LogCaptureFixture, given: dict[str, Any], answer: str
+) -> None:
+    item_id, decision = await twice_run_out(board, conn)
+    caplog.set_level(logging.INFO, logger="factory_board.server")
+    answered = await board.call(AS_OPERATOR, "answer", item_id=decision, **given)
+    assert answered == {
+        "status": "answered",
+        "confirmation": f"decision for pr {REPO}#202: choose one of 2 options: {answer}",
+        "also_closed": [{"id": item_id, "confirmation": REVIEW_LABEL}],
+    }
+    assert [record.getMessage() for record in caplog.records] == [
+        f"[BOARD] item={decision} kind=decision verb=answer actor={OPERATOR.identity}",
+        f"[BOARD] item={item_id} kind=review verb=cascade actor={OPERATOR.identity}",
+    ]
+    closed = await board.call(AS_OPERATOR, "get_item", item_id=item_id)
+    assert (closed["open"], closed["resolution"]) == (False, "superseded")
+    assert closed["result"] == {"cause": "after", "item": decision, "resolution": "answered"}
+    assert (await queue(board))["items"] == []
+    # The subject is free: the reconciler writes the next review item.
+    assert await staged(board, REVIEW) != item_id
+
+
+async def test_try_again_puts_the_item_back_in_the_queue(board: Board, conn: Any) -> None:
+    item_id, decision = await twice_run_out(board, conn)
+    answered = await board.call(AS_OPERATOR, "answer", item_id=decision, option=1)
+    assert answered["status"] == "answered"
+    assert answered["confirmation"].endswith(
+        ": Try again: the item goes back in the queue, for two more runs"
+    )
+    assert answered["also_closed"] == []
+    listed = await queue(board)
+    assert [(entry["id"], entry["rank"], entry["expiries"]) for entry in listed["items"]] == [
+        (item_id, 4, 2)
+    ]
+    assert "waiting_on" not in listed["items"][0]
+    # Two more runs, and the operator is asked again.
+    assert await run_out(board, conn, item_id, "20260101-review-03") is None
+    second = await run_out(board, conn, item_id, "20260101-review-04")
+    assert second not in (None, decision)
+    assert [e["id"] for e in (await board.call(AS_OPERATOR, "list_items"))["items"]] == [second]
+
+
+async def test_a_reject_of_the_decision_closes_the_item_too(board: Board, conn: Any) -> None:
+    item_id, decision = await twice_run_out(board, conn)
+    rejected = await board.call(AS_OPERATOR, "reject", item_id=decision, reason="not now")
+    assert rejected["also_closed"] == [{"id": item_id, "confirmation": REVIEW_LABEL}]
+
+
+async def test_an_answer_to_any_other_decision_closes_nothing_else(board: Board) -> None:
+    first = await board.create(DECISION)
+    await board.create(numbered(MANUAL, 102), after=[first])
+    answered = await board.call(AS_OPERATOR, "answer", item_id=first, option=2)
+    assert answered["also_closed"] == []
