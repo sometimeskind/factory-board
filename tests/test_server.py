@@ -461,10 +461,15 @@ async def test_the_metrics_count_items_and_carry_no_text(board: Board, store: St
     for summary in ("Then this.", "And this."):
         await board.create(MANUAL | {"summary": summary}, after=[first])
 
+    await board.call(AS_SESSION, "create_item", item=numbered(MANUAL, 102), holds=False)
+
     metrics.show(await store.stats(Caller(Tier.PROCESS, "process:metrics")))
 
     def sample(name: str, **labels: str) -> float | None:
         return REGISTRY.get_sample_value(name, labels)
+
+    def issue_items(number: int) -> float | None:
+        return sample("factory_board_issue_open_items", repo=REPO, issue=str(number))
 
     def open_items(urgent: str, deferred: str, waiting: str = "false") -> float | None:
         return sample(
@@ -475,12 +480,16 @@ async def test_the_metrics_count_items_and_carry_no_text(board: Board, store: St
             waiting=waiting,
         )
 
-    assert open_items("false", "false") == 1
+    # The decision, and the item on the other issue that doesn't hold it.
+    assert open_items("false", "false") == 2
     assert open_items("true", "false") == 1
     assert open_items("false", "true") == 1
     assert open_items("false", "false", "true") == 2
     assert open_items("true", "false", "true") is None
     assert sample("factory_board_closed_items", assignee="operator", resolution="done") == 1
+    # The five open ones are on one issue; the item that doesn't hold adds no series.
+    assert issue_items(101) == 5
+    assert issue_items(102) is None
     oldest = sample(
         "factory_board_oldest_open_item_created_timestamp_seconds",
         assignee="operator",
@@ -500,3 +509,4 @@ async def test_the_metrics_count_items_and_carry_no_text(board: Board, store: St
     assert open_items("false", "false") == 0
     assert open_items("true", "false") is None
     assert open_items("false", "false", "true") is None
+    assert issue_items(101) is None

@@ -25,6 +25,14 @@ OLDEST_OPEN_ITEM = Gauge(
     ["assignee", "urgent", "deferred", "waiting"],
 )
 CLOSED_ITEMS = Gauge("factory_board_closed_items", "Closed items, ever", ["assignee", "resolution"])
+# One series per issue the operator has an open item on that holds it, and none for any other
+# issue. Read it together with the refresh timestamp: a missing series means "no item" only
+# while the gauges are fresh.
+ISSUE_OPEN_ITEMS = Gauge(
+    "factory_board_issue_open_items",
+    "The operator's open items that hold an issue",
+    ["repo", "issue"],
+)
 LAST_REFRESH = Gauge(
     "factory_board_metrics_refresh_timestamp_seconds",
     "When the item gauges were last read from the database",
@@ -38,6 +46,7 @@ def show(stats: Stats) -> None:
     OPEN_ITEMS.clear()
     OLDEST_OPEN_ITEM.clear()
     CLOSED_ITEMS.clear()
+    ISSUE_OPEN_ITEMS.clear()
     # The operator's plain series is always there, so a rule on it never sees "no data".
     OPEN_ITEMS.labels("operator", "false", "false", "false").set(0)
     for row in stats.open:
@@ -51,4 +60,6 @@ def show(stats: Stats) -> None:
         OLDEST_OPEN_ITEM.labels(*labels).set(row.oldest_created)
     for row in stats.closed:
         CLOSED_ITEMS.labels(row.assignee, row.resolution).set(row.count)
+    for row in stats.issues:
+        ISSUE_OPEN_ITEMS.labels(row.repo, row.issue).set(row.count)
     LAST_REFRESH.set_to_current_time()
