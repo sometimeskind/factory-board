@@ -152,6 +152,7 @@ async def test_an_item_needs_a_ticket_or_a_key(board: Board) -> None:
         {"operator_typed": False},
         {"urgent": True},
         {"command": "make widgets\nrm -rf /"},
+        {"waiting_on": []},
     ],
 )
 async def test_a_create_takes_nothing_about_the_caller_from_its_input(
@@ -286,6 +287,150 @@ async def test_the_nightly_closes_only_what_it_holds(board: Board) -> None:
     assert closed["resolution"] == "superseded"
 
 
+def numbered(item: dict[str, Any], number: int) -> dict[str, Any]:
+    """The same item on another made-up issue."""
+    return item | {"ticket": {"repo": REPO, "number": number}}
+
+
+async def test_an_item_shows_what_it_waits_on_and_only_then(board: Board) -> None:
+    first = await board.create(MANUAL)
+    plain = await board.call(AS_OPERATOR, "get_item", item_id=first)
+    assert not {"after", "waiting_on", "holds"} & set(plain)
+
+    created = await board.call(
+        AS_SESSION, "create_item", item=numbered(DECISION, 102), after=[first], holds=False
+    )
+    second = created["item"]
+    assert (second["after"], second["waiting_on"], second["holds"]) == ([first], [first], False)
+    # Not hidden from the list: after what can be done now.
+    third = await board.create(numbered(MANUAL, 103))
+    listed = await board.call(AS_OPERATOR, "list_items")
+    assert [entry["id"] for entry in listed["items"]] == [first, third, second["id"]]
+    assert listed["items"][2]["waiting_on"] == [first]
+
+    await board.call(AS_OPERATOR, "done", item_id=first)
+    released = await board.call(AS_OPERATOR, "get_item", item_id=second["id"])
+    assert released["after"] == [first]
+    assert "waiting_on" not in released
+    assert released["holds"] is False
+
+
+async def test_the_nightly_s_item_can_wait_too(board: Board) -> None:
+    first = await board.create(MANUAL)
+    created = await board.call(AS_NIGHTLY, "create_keyed_item", key=KEY, item=KEYED, after=[first])
+    assert created["item"]["waiting_on"] == [first]
+    # Whether an item holds its issue is said with a ticket, and the nightly's has none.
+    with pytest.raises(ToolError):
+        await board.call(AS_NIGHTLY, "create_keyed_item", key=KEY, item=KEYED, holds=False)
+
+
+async def test_holds_false_needs_an_issue(board: Board) -> None:
+    for item, arguments in [
+        (KEYED, {"key": KEY}),
+        (PR_APPROVE, {}),
+        (PR_APPROVE | {"ticket": TICKET}, {}),
+    ]:
+        with pytest.raises(ToolError, match="holds=false is for an item on an issue"):
+            await board.call(AS_SESSION, "create_item", item=item, holds=False, **arguments)
+    assert (await board.call(AS_OPERATOR, "list_items"))["items"] == []
+
+
+async def test_what_an_item_is_after_is_checked(board: Board) -> None:
+    first = await board.create(MANUAL)
+    rejected = await board.create(numbered(MANUAL, 102))
+    await board.call(AS_OPERATOR, "reject", item_id=rejected, reason="no")
+    for bad, message in [
+        (["abcdefgh"], "no item abcdefgh"),
+        ([first, first], "twice"),
+        ([rejected], "was closed as rejected"),
+    ]:
+        with pytest.raises(ToolError, match=message):
+            await board.call(AS_SESSION, "create_item", item=numbered(MANUAL, 103), after=bad)
+    for bad in (["not an id"], [first] * 11, first):
+        with pytest.raises(ToolError):
+            await board.call(AS_SESSION, "create_item", item=numbered(MANUAL, 103), after=bad)
+    listed = await board.call(AS_OPERATOR, "list_items")
+    assert [entry["id"] for entry in listed["items"]] == [first]
+
+
+async def test_done_and_answer_are_refused_on_a_waiting_item(board: Board) -> None:
+    first = await board.create(MANUAL)
+    command = await board.create(numbered(MANUAL, 102), after=[first])
+    question = await board.create(numbered(DECISION, 103), after=[first])
+    with pytest.raises(ToolError, match=f"item {command} waits on {first} and cannot be closed"):
+        await board.call(AS_OPERATOR, "done", item_id=command)
+    with pytest.raises(ToolError, match=f"item {question} waits on {first} and cannot be closed"):
+        await board.call(AS_OPERATOR, "answer", item_id=question, option=1)
+    for item_id in (command, question):
+        assert (await board.call(AS_OPERATOR, "get_item", item_id=item_id))["open"] is True
+
+    await board.call(AS_OPERATOR, "done", item_id=first)
+    await board.call(AS_OPERATOR, "done", item_id=command)
+    await board.call(AS_OPERATOR, "answer", item_id=question, option=1)
+
+
+async def test_reject_names_what_it_closed_down_the_chain(
+    board: Board, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = await board.create(MANUAL)
+    second = await board.create(numbered(DECISION, 102), after=[first])
+    third = (
+        await board.call(AS_NIGHTLY, "create_keyed_item", key=KEY, item=KEYED, after=[second])
+    )["item"]["id"]
+    bystander = await board.create(numbered(MANUAL, 104))
+
+    caplog.set_level(logging.INFO, logger="factory_board.server")
+    rejected = await board.call(AS_OPERATOR, "reject", item_id=first, reason="the press is sold")
+    assert rejected["status"] == "rejected; 2 items that waited on it are closed too"
+    assert rejected["also_closed"] == [
+        {"id": second, "confirmation": f"decision for issue {REPO}#102: choose one of 2 options"},
+        {"id": third, "confirmation": f"manual for finding {KEY}: free text: open the vent"},
+    ]
+    lines = [record.getMessage() for record in caplog.records]
+    assert lines == [
+        f"[BOARD] item={first} kind=manual verb=reject actor={OPERATOR.identity}",
+        f"[BOARD] item={second} kind=decision verb=cascade actor={OPERATOR.identity}",
+        f"[BOARD] item={third} kind=manual verb=cascade actor={OPERATOR.identity}",
+    ]
+    for item_id in (second, third):
+        closed = await board.call(AS_OPERATOR, "get_item", item_id=item_id)
+        assert (closed["resolution"], closed["result"]) == (
+            "superseded",
+            {"cause": "after", "item": first, "resolution": "rejected"},
+        )
+    listed = await board.call(AS_OPERATOR, "list_items")
+    assert [entry["id"] for entry in listed["items"]] == [bystander]
+
+    alone = await board.call(AS_OPERATOR, "reject", item_id=bystander, reason="nor this")
+    assert (alone["status"], alone["also_closed"]) == ("rejected", [])
+
+
+async def test_a_reply_that_closes_names_what_it_closed_too(
+    board: Board, caplog: pytest.LogCaptureFixture
+) -> None:
+    first = await board.create(MANUAL)
+    second = await board.create(numbered(MANUAL, 102), after=[first])
+    held_elsewhere = await board.keyed()
+    after_that = await board.create(numbered(MANUAL, 103), after=[held_elsewhere])
+
+    caplog.set_level(logging.INFO, logger="factory_board.server")
+    replied = await board.call(AS_OPERATOR, "reply", item_id=first, text="did it another way")
+    assert replied["status"] == "replied and closed; 1 item that waited on it is closed too"
+    assert [entry["id"] for entry in replied["also_closed"]] == [second]
+    closed = await board.call(AS_OPERATOR, "get_item", item_id=second)
+    assert closed["result"] == {"cause": "after", "item": first, "resolution": "replied"}
+    assert [record.getMessage().split()[3] for record in caplog.records] == [
+        "verb=reply",
+        "verb=cascade",
+    ]
+
+    # A reply that leaves its item open closes nothing after it.
+    stays = await board.call(AS_OPERATOR, "reply", item_id=held_elsewhere, text="vent is stuck")
+    assert stays["also_closed"] == []
+    waiting = await board.call(AS_OPERATOR, "get_item", item_id=after_that)
+    assert (waiting["open"], waiting["waiting_on"]) == (True, [held_elsewhere])
+
+
 async def test_every_create_and_verb_logs_one_line_without_item_text(
     board: Board, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -313,32 +458,45 @@ async def test_the_metrics_count_items_and_carry_no_text(board: Board, store: St
     deferred = await board.create(MANUAL | {"summary": "Later."})
     await board.call(AS_OPERATOR, "defer", item_id=deferred, until=AHEAD)
     await board.call(AS_OPERATOR, "done", item_id=await board.create(MANUAL | {"summary": "X."}))
+    for summary in ("Then this.", "And this."):
+        await board.create(MANUAL | {"summary": summary}, after=[first])
 
     metrics.show(await store.stats(Caller(Tier.PROCESS, "process:metrics")))
 
     def sample(name: str, **labels: str) -> float | None:
         return REGISTRY.get_sample_value(name, labels)
 
-    def open_items(urgent: str, deferred: str) -> float | None:
+    def open_items(urgent: str, deferred: str, waiting: str = "false") -> float | None:
         return sample(
-            "factory_board_open_items", assignee="operator", urgent=urgent, deferred=deferred
+            "factory_board_open_items",
+            assignee="operator",
+            urgent=urgent,
+            deferred=deferred,
+            waiting=waiting,
         )
 
     assert open_items("false", "false") == 1
     assert open_items("true", "false") == 1
     assert open_items("false", "true") == 1
+    assert open_items("false", "false", "true") == 2
+    assert open_items("true", "false", "true") is None
     assert sample("factory_board_closed_items", assignee="operator", resolution="done") == 1
     oldest = sample(
         "factory_board_oldest_open_item_created_timestamp_seconds",
         assignee="operator",
         urgent="true",
         deferred="false",
+        waiting="false",
     )
     assert oldest is not None and abs(oldest - datetime.now(UTC).timestamp()) < 300
 
     # With nothing open, the operator's plain series reads 0 and the others are gone.
-    for entry in (await board.call(AS_OPERATOR, "list_items", include_deferred=True))["items"]:
+    # From the end of the list: the waiting ones go before the item whose reject would
+    # close them.
+    listed = await board.call(AS_OPERATOR, "list_items", include_deferred=True)
+    for entry in reversed(listed["items"]):
         await board.call(AS_OPERATOR, "reject", item_id=entry["id"], reason="clearing")
     metrics.show(await store.stats(Caller(Tier.PROCESS, "process:metrics")))
     assert open_items("false", "false") == 0
     assert open_items("true", "false") is None
+    assert open_items("false", "false", "true") is None

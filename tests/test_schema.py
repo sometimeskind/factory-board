@@ -92,6 +92,29 @@ def test_a_valid_row_is_accepted(owner: psycopg.Connection) -> None:
         ({"resolution": "done"}, "items_closed_with_resolution"),
         ({"closed_at": "2030-01-01", "resolution": "undone"}, "items_resolution_allowed"),
         ({"closed_at": "2030-01-01", "resolution": "Done"}, "items_resolution_allowed"),
+        # Only an operator's item on an issue can say it does not hold the issue.
+        (
+            {"holds": False, "assignee": "work", "kind": "work", "claimed_by": None},
+            "items_holds_false_on_operator_issue",
+        ),
+        (
+            {"holds": False, "subject_type": "pr", "subject_ref": "202"},
+            "items_holds_false_on_operator_issue",
+        ),
+        (
+            {"holds": False, "subject_repo": None, "subject_type": "alert"},
+            "items_holds_false_on_operator_issue",
+        ),
+        (
+            {
+                "holds": False,
+                "subject_repo": None,
+                "subject_type": None,
+                "subject_ref": None,
+                "key": "finding:widget-press-hot",
+            },
+            "items_holds_false_on_operator_issue",
+        ),
     ],
 )
 def test_a_bad_value_is_refused(
@@ -219,12 +242,74 @@ def test_a_reply_needs_an_item_an_identity_and_a_text(owner: psycopg.Connection)
         owner.execute(add, ("abcdefgh", "human:operator", ""))
 
 
+def test_an_item_holds_its_issue_unless_it_says_not(owner: psycopg.Connection) -> None:
+    insert_row(owner, id="aaaaaaaa")
+    insert_row(owner, id="bbbbbbbb", holds=False)
+    rows = owner.execute("SELECT id, holds FROM items ORDER BY id").fetchall()
+    assert rows == [("aaaaaaaa", True), ("bbbbbbbb", False)]
+
+
+EDGE = "INSERT INTO item_after (item_id, after_id) VALUES (%s, %s)"
+
+
+def test_an_edge_joins_two_different_items_once(owner: psycopg.Connection) -> None:
+    insert_row(owner, id="aaaaaaaa")
+    insert_row(owner, id="bbbbbbbb")
+    owner.execute(EDGE, ("bbbbbbbb", "aaaaaaaa"))
+    with pytest.raises(errors.UniqueViolation):
+        owner.execute(EDGE, ("bbbbbbbb", "aaaaaaaa"))
+    with pytest.raises(errors.CheckViolation) as refused:
+        owner.execute(EDGE, ("bbbbbbbb", "bbbbbbbb"))
+    assert refused.value.diag.constraint_name == "item_after_not_itself"
+    for edge in (("bbbbbbbb", "zzzzzzzz"), ("zzzzzzzz", "aaaaaaaa")):
+        with pytest.raises(errors.ForeignKeyViolation):
+            owner.execute(EDGE, edge)
+    assert owner.execute("SELECT * FROM item_after").fetchall() == [("bbbbbbbb", "aaaaaaaa")]
+
+
+@pytest.mark.parametrize("resolution", ["done", "answered", "replied", "rejected", "superseded"])
+def test_no_edge_points_at_a_failure(owner: psycopg.Connection, resolution: str) -> None:
+    """Whoever writes it, the owner included: nothing waits on a rejected or replied item."""
+    insert_row(owner, id="aaaaaaaa", closed_at="2030-01-01", resolution=resolution)
+    insert_row(owner, id="bbbbbbbb")
+    if resolution in ("rejected", "replied"):
+        with pytest.raises(errors.CheckViolation, match=f"aaaaaaaa was closed as {resolution}"):
+            owner.execute(EDGE, ("bbbbbbbb", "aaaaaaaa"))
+    else:
+        owner.execute(EDGE, ("bbbbbbbb", "aaaaaaaa"))
+
+
+@pytest.mark.parametrize("resolution", ["done", "answered"])
+def test_the_owner_does_not_close_a_waiting_item_as_a_success_either(
+    owner: psycopg.Connection, resolution: str
+) -> None:
+    insert_row(owner, id="aaaaaaaa")
+    insert_row(owner, id="bbbbbbbb")
+    insert_row(owner, id="cccccccc")
+    owner.execute(EDGE, ("cccccccc", "aaaaaaaa"))
+    owner.execute(EDGE, ("cccccccc", "bbbbbbbb"))
+    close = "UPDATE items SET closed_at = now(), resolution = %s WHERE id = %s"
+    with pytest.raises(psycopg.Error) as refused:
+        owner.execute(close, (resolution, "cccccccc"))
+    assert refused.value.sqlstate == "BRD02"
+    assert f"item cccccccc waits on aaaaaaaa, bbbbbbbb and cannot be closed as {resolution}" in str(
+        refused.value
+    )
+    owner.execute(close, ("done", "aaaaaaaa"))
+    owner.execute(close, ("superseded", "bbbbbbbb"))
+    assert owner.execute(close, (resolution, "cccccccc")).rowcount == 1
+
+
 def test_the_tables_are_forced_under_row_security(owner: psycopg.Connection) -> None:
     rows = owner.execute(
         "SELECT relname, relrowsecurity, relforcerowsecurity, pg_get_userbyid(relowner) "
-        "FROM pg_class WHERE relname IN ('items', 'replies') ORDER BY relname"
+        "FROM pg_class WHERE relname IN ('items', 'replies', 'item_after') ORDER BY relname"
     ).fetchall()
-    assert rows == [("items", True, True, "board_owner"), ("replies", True, True, "board_owner")]
+    assert rows == [
+        ("item_after", True, True, "board_owner"),
+        ("items", True, True, "board_owner"),
+        ("replies", True, True, "board_owner"),
+    ]
 
 
 def test_item_ids_come_from_no_sequence(owner: psycopg.Connection) -> None:

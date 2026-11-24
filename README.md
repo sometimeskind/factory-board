@@ -18,7 +18,7 @@ and the MCP tools come in later PRs; nothing serves requests yet.
 |---|---|
 | `factory_board/config.py` | Settings, read from the environment |
 | `factory_board/migrate.py` | The migration runner |
-| `factory_board/store.py` | The store: items and replies, read and written as the caller's tier |
+| `factory_board/store.py` | The store: items, their edges and replies, read and written as the caller's tier |
 | `migrations/` | Numbered SQL migrations, shipped in the image ([rules](migrations/README.md)) |
 | `dev/roles.sql` | The five roles, for a throwaway database. Not a migration and not in the image |
 | `tests/` | Tests against a real Postgres |
@@ -45,9 +45,9 @@ What each tier may do with a row (`migrations/0003_access.sql`):
 
 | Tier | SELECT | INSERT | UPDATE | DELETE |
 |---|---|---|---|---|
-| `board_operator` | Every item and reply | Items and replies, as itself | Any open item: close, defer, bump | No |
-| `board_agent` | Every item and reply | Items, as itself and in its own run | An open item it holds itself: close | No |
-| `board_process` | Every item and reply | Items, as itself, never `operator_typed` | An open item it holds itself: close | No |
+| `board_operator` | Every item, edge and reply | Items and replies, as itself | Any open item: close, defer, bump | No |
+| `board_agent` | Every item, edge and reply | Items, as itself and in its own run | An open item it holds itself: close | No |
+| `board_process` | Every item, edge and reply | Items, as itself, never `operator_typed` | An open item it holds itself: close | No |
 
 - "As itself": `created_by`, or a reply's `author`, must equal `board.actor`. For an agent,
   `created_run` must be the ID in its identity. Whether the operator typed into the run
@@ -65,8 +65,14 @@ What each tier may do with a row (`migrations/0003_access.sql`):
   or a process move the head SHA of an open `pr-approve` or `pr-merge` item that someone else
   holds. The caller names the PR, and it must be the item's. Each move is appended to the
   item's `head_sha_moves` (old SHA, new SHA, who, when), so the operator sees that the SHA
-  changed after the item was written. It is the only `SECURITY DEFINER` function and the only
-  way to change anything in `fields`.
+  changed after the item was written. It is the only `SECURITY DEFINER` function a tier can
+  call and the only way to change anything in `fields`.
+- An edge (`item_after`, `migrations/0005_after.sql`) is written with its item: a tier may
+  insert one only for an item it created in the same transaction, and none may change or
+  delete one. See [Waiting](#waiting).
+- `holds` is written with the item and never changed. It says whether an operator's item
+  holds its issue (the issue waits on the operator because of it), and may be false only on
+  an operator's item about an issue (a CHECK). Nothing reads it yet.
 - Postgres refuses an `UPDATE` under these policies silently: no row changes and nothing is
   raised. The store checks the row count and raises `NotClaimHolder`, `ItemClosed` or
   `ItemNotFound`.
@@ -79,6 +85,27 @@ configuration, where the database's owner can't create any. The first migration 
 the missing role's name if one is not there. For a throwaway database, a superuser runs
 [`dev/roles.sql`](dev/roles.sql) first: it creates the five roles with fixed passwords and
 gives the database to `board_owner`.
+
+## Waiting
+
+An item may be created `after` up to 10 existing items. The edges are set then and never
+changed, so there are no cycles.
+
+- **Waiting is derived, not stored**, as "deferred" is from `not_before`: an open item is
+  waiting while an item it is after is open. The store returns `after` (every edge) and
+  `waiting_on` (the ones still open), and lists waiting items last.
+- **Success is required.** An item closed as `done`, `answered` or `superseded` lets go of
+  what waits on it. Closing one as `rejected` or `replied` closes every open item that waits
+  on it, down the whole chain and in the same transaction, as `superseded` with the result
+  `{"cause": "after", "item": <the item whose close started it>, "resolution": ...}`.
+- **A waiting item can't be closed as `done` or `answered`**, by anyone (a trigger, SQLSTATE
+  `BRD02`; the store raises `ItemWaiting`). It can be rejected, replied to or superseded.
+- An item may be created after a closed item, unless that one closed as `rejected` or
+  `replied`.
+- The cascade is the second `SECURITY DEFINER` function, a trigger's: the items down the
+  chain may be held by anyone, and closing them is the board's act, not the caller's.
+- A new edge and a cascade take one advisory lock, so an item can't slip in behind a
+  reject that is closing what it would wait on.
 
 ## Callers
 
@@ -111,11 +138,16 @@ port of their own. A tool outside the caller's row is refused.
 - `done`, `answer` and `defer` work on an item a person holds. `reply` closes such an item
   as replied; on an item someone else holds it attaches the reply and leaves it open.
   `reject` and `bump` work on any open item.
+- `create_item` and `create_keyed_item` take `after`, and `create_item` takes `holds`
+  ([Waiting](#waiting)). An item shows `after` and `waiting_on` when it has any, and `holds`
+  when it is false. `done` and `answer` are refused on a waiting item. `reject`, and a
+  `reply` that closes, answer with `also_closed`: the items the close took with it.
 - A session's item is held by `human:<operator>`; the nightly holds its keyed items.
 - Every create and verb logs `[BOARD] item=… kind=… verb=… actor=…`, with no item text.
+  An item closed by a cascade gets a line of its own, with the verb `cascade`.
 - The metrics are read from the database every 30 seconds: `factory_board_open_items` and
   `factory_board_oldest_open_item_created_timestamp_seconds` (by assignee, urgent,
-  deferred), `factory_board_closed_items` (by assignee, resolution), and
+  deferred, waiting), `factory_board_closed_items` (by assignee, resolution), and
   `factory_board_tool_calls_total`.
 
 ## Settings

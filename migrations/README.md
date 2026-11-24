@@ -12,10 +12,10 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 
 - A migration creates no role. It grants to the roles and writes policies for them, and
   `0001` stops with a clear message when one is missing ([Roles](../README.md#roles)).
-- The migrations run as the tables' owner. `items` and `replies` are under `FORCE ROW LEVEL
-  SECURITY`, so the owner reads and writes them through the `*_owner` policies; a new table
-  under row security needs one too, or a later migration's `UPDATE` on it changes no row and
-  says nothing.
+- The migrations run as the tables' owner. `items`, `replies` and `item_after` are under
+  `FORCE ROW LEVEL SECURITY`, so the owner reads and writes them through the `*_owner`
+  policies; a new table under row security needs one too, or a later migration's `UPDATE` on
+  it changes no row and says nothing.
 - The tiers' grants on `items` are by column. A migration that adds a column, or a step that
   starts writing one, grants it to the tiers that need it and to no other.
 
@@ -25,5 +25,6 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 | `0002_replies.sql` | The `replies` table |
 | `0003_access.sql` | The column grants, row-level security and its policies, and `set_pr_head_sha` |
 | `0004_oauth_proxy.sql` | The login proxy's key-value table, the one table `board_app` uses as itself |
+| `0005_after.sql` | The `holds` column; the `item_after` table (which item waits on which) with its grants and policies; the triggers that keep a waiting item from closing as done and that close what waits on a rejected item |
 
 The `schema_migrations` table is created by the runner itself.
