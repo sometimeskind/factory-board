@@ -26,5 +26,6 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 | `0003_access.sql` | The column grants, row-level security and its policies, and `set_pr_head_sha` |
 | `0004_oauth_proxy.sql` | The login proxy's key-value table, the one table `board_app` uses as itself |
 | `0005_after.sql` | The `holds` column; the `item_after` table (which item waits on which) with its grants and policies; the triggers that keep a waiting item from closing as done and that close what waits on a rejected item |
+| `0006_machine_other.sql` | The machine `other`, for a step done on none of the listed machines |
 
 The `schema_migrations` table is created by the runner itself.

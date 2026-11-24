@@ -174,6 +174,8 @@ def view(item: Item, replies: list[Reply] | None = None) -> dict[str, Any]:
             "free_text": rendered.free_text,
             "fields": item.fields,
         }
+        if rendered.place is not None:
+            out["place"] = rendered.place
     if not item.holds:
         out["holds"] = False
     if item.after:

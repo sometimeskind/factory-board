@@ -64,6 +64,8 @@ class Machine(StrEnum):
     PHONE_VM = "phone-vm"
     WORKSTATION = "workstation"
     PILOT = "pilot"
+    # Anywhere else (a tablet, a phone, the router's console); the item names it in `place`.
+    OTHER = "other"
 
 
 class SubjectType(StrEnum):
@@ -139,6 +141,9 @@ Prose = Annotated[str, StringConstraints(min_length=1, max_length=500), AfterVal
 CommandText = Annotated[
     str, StringConstraints(min_length=1, max_length=2000), AfterValidator(_one_line)
 ]
+
+# Where the operator does a step that is on none of the listed machines.
+Place = Annotated[str, StringConstraints(min_length=1, max_length=60), AfterValidator(_one_line)]
 
 # `owner/name` as GitHub spells it.
 Repo = Annotated[
@@ -239,6 +244,8 @@ class Rendered(_Model):
 
     kind: OperatorKind
     machine: Machine | None
+    # Named by the writer when the machine is `other`.
+    place: str | None = None
     # In the order to run them.
     commands: tuple[str, ...]
     url: str | None
@@ -264,6 +271,7 @@ class _OperatorItem(_Model):
         subject: Subject,
         *,
         machine: Machine | None,
+        place: str | None = None,
         commands: tuple[str, ...] = (),
         url: str | None = None,
         free_text: bool = False,
@@ -276,6 +284,7 @@ class _OperatorItem(_Model):
         return Rendered(
             kind=kind,
             machine=machine,
+            place=place,
             commands=commands,
             url=url,
             free_text=free_text,
@@ -489,12 +498,23 @@ class Manual(_OperatorItem):
     # Shown as written. Nothing checks it, so the rendering marks it as free text.
     command: CommandText
     machine: Machine
+    # Free text like the command: where the step happens when no listed machine fits.
+    place: Place | None = None
+
+    @model_validator(mode="after")
+    def _place_goes_with_other(self) -> Self:
+        if self.machine is Machine.OTHER and self.place is None:
+            raise ValueError("machine 'other' needs a place: say where the step is done")
+        if self.machine is not Machine.OTHER and self.place is not None:
+            raise ValueError("place is only for machine 'other'")
+        return self
 
     def render(self, subject: Subject) -> Rendered:
         return self._rendered(
             OperatorKind.MANUAL,
             subject,
             machine=self.machine,
+            place=self.place,
             commands=(self.command,),
             free_text=True,
         )

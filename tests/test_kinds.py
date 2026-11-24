@@ -85,7 +85,7 @@ def test_the_exported_names() -> None:
         "merge",
     )
     assert kinds.KINDS == kinds.OPERATOR_KINDS + kinds.STAGE_KINDS
-    assert kinds.MACHINES == ("browser", "phone-vm", "workstation", "pilot")
+    assert kinds.MACHINES == ("browser", "phone-vm", "workstation", "pilot", "other")
     assert kinds.SUBJECT_TYPES == ("issue", "pr", "alert", "finding")
     assert kinds.TERRAFORM_MODULES == (
         "talos",
@@ -548,6 +548,26 @@ def test_manual_is_marked_free_text() -> None:
     assert rendered.commands == (command,)
     assert rendered.free_text is True
     assert rendered.confirmation == f"manual for issue example/repo#101: free text: {command}"
+
+
+def test_manual_elsewhere_names_its_place() -> None:
+    fields = {"command": "hold the reset button for ten seconds"}
+    parsed = parse_operator_item(item("manual", machine="other", place="widget press", **fields))
+    assert isinstance(parsed, Manual)
+    rendered = parsed.render(ISSUE)
+    assert rendered.machine is Machine.OTHER
+    assert rendered.place == "widget press"
+    assert "needs a place" in refused(item("manual", machine="other", **fields))
+    assert "only for machine 'other'" in refused(
+        item("manual", machine="workstation", place="widget press", **fields)
+    )
+    refused(item("manual", machine="other", place="", **fields))
+    refused(item("manual", machine="other", place="line\nbreak", **fields))
+    refused(item("manual", machine="other", place="x" * 61, **fields))
+    # No other kind takes the value or the field.
+    pr = {"repo": "example/repo", "number": 202, "head_sha": SHA}
+    refused(item("pr-approve", machine="other", **pr))
+    refused(item("decision", options=["one", "two"], place="widget press"))
 
 
 def test_only_manual_and_session_are_free_text() -> None:
