@@ -16,11 +16,13 @@ STATIC_TOKEN_REFUSED = Counter(
 TOOL_CALLS = Counter("factory_board_tool_calls_total", "MCP tool calls", ["tool", "outcome"])
 
 # Read from the database every REFRESH_SECONDS, so they survive a restart and a restore.
-OPEN_ITEMS = Gauge("factory_board_open_items", "Open items", ["assignee", "urgent", "deferred"])
+OPEN_ITEMS = Gauge(
+    "factory_board_open_items", "Open items", ["assignee", "urgent", "deferred", "waiting"]
+)
 OLDEST_OPEN_ITEM = Gauge(
     "factory_board_oldest_open_item_created_timestamp_seconds",
     "When the oldest open item was created",
-    ["assignee", "urgent", "deferred"],
+    ["assignee", "urgent", "deferred", "waiting"],
 )
 CLOSED_ITEMS = Gauge("factory_board_closed_items", "Closed items, ever", ["assignee", "resolution"])
 LAST_REFRESH = Gauge(
@@ -37,9 +39,14 @@ def show(stats: Stats) -> None:
     OLDEST_OPEN_ITEM.clear()
     CLOSED_ITEMS.clear()
     # The operator's plain series is always there, so a rule on it never sees "no data".
-    OPEN_ITEMS.labels("operator", "false", "false").set(0)
+    OPEN_ITEMS.labels("operator", "false", "false", "false").set(0)
     for row in stats.open:
-        labels = (row.assignee, str(row.urgent).lower(), str(row.deferred).lower())
+        labels = (
+            row.assignee,
+            str(row.urgent).lower(),
+            str(row.deferred).lower(),
+            str(row.waiting).lower(),
+        )
         OPEN_ITEMS.labels(*labels).set(row.count)
         OLDEST_OPEN_ITEM.labels(*labels).set(row.oldest_created)
     for row in stats.closed:

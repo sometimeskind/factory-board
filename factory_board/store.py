@@ -45,6 +45,28 @@ PR_KINDS = ("pr-approve", "pr-merge")
 
 # The SQLSTATE the items_closed_is_final trigger raises.
 _CLOSED_SQLSTATE = "BRD01"
+# And the items_waiting_is_not_done trigger's.
+_WAITING_SQLSTATE = "BRD02"
+
+# How many items one item may wait on.
+MAX_AFTER = 10
+
+# An item as the store reads it: its row, the items it is after, and the ones of those
+# that are still open. Waiting is derived here and stored nowhere; a closed item waits on
+# nothing.
+_ITEM = sql.SQL(
+    """
+    items.*,
+    ARRAY(
+        SELECT a.after_id FROM item_after AS a WHERE a.item_id = items.id
+    ) AS after,
+    ARRAY(
+        SELECT a.after_id
+        FROM item_after AS a JOIN items AS before ON before.id = a.after_id
+        WHERE a.item_id = items.id AND items.closed_at IS NULL AND before.closed_at IS NULL
+    ) AS waiting_on
+    """
+)
 
 _HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -103,6 +125,10 @@ class InvalidItem(StoreError):
     """The database refused a value: a bad ID, assignee, kind, identity or the like."""
 
 
+class ItemWaiting(StoreError):
+    """The item waits on an open item, and so can't be closed as done or answered."""
+
+
 @dataclass(frozen=True)
 class Caller:
     """Who is asking: the tier their token carries, and their identity."""
@@ -145,6 +171,10 @@ class NewItem:
     input_hash: str | None = None
     created_run: str | None = None
     operator_typed: bool = False
+    # The items this one waits on. Set here and never changed.
+    after: tuple[str, ...] = ()
+    # Whether an operator's item holds its issue. Only an item on an issue can say no.
+    holds: bool = True
 
 
 @dataclass(frozen=True)
@@ -172,6 +202,10 @@ class Item:
     created_run: str | None
     operator_typed: bool
     created_at: datetime
+    holds: bool
+    # Every item this one is after, and the ones of them that are still open. Both sorted.
+    after: tuple[str, ...]
+    waiting_on: tuple[str, ...]
 
     @property
     def is_open(self) -> bool:
@@ -200,6 +234,7 @@ class OpenCount:
     assignee: str
     urgent: bool
     deferred: bool
+    waiting: bool
     count: int
     # When the oldest of them was created, in seconds since the epoch.
     oldest_created: float
@@ -256,6 +291,9 @@ def _item(row: DictRow) -> Item:
         created_run=row["created_run"],
         operator_typed=row["operator_typed"],
         created_at=row["created_at"],
+        holds=row["holds"],
+        after=tuple(sorted(row["after"])),
+        waiting_on=tuple(sorted(row["waiting_on"])),
     )
 
 
@@ -267,6 +305,8 @@ def _translate(exc: psycopg.Error) -> StoreError | None:
     """The store's error for a database error, or None for one it does not know."""
     if exc.sqlstate == _CLOSED_SQLSTATE:
         return ItemClosed(exc.diag.message_primary or "the item is closed")
+    if exc.sqlstate == _WAITING_SQLSTATE:
+        return ItemWaiting(exc.diag.message_primary or "the item is waiting")
     if isinstance(exc, errors.InsufficientPrivilege):
         return NotPermitted(exc.diag.message_primary or "not permitted")
     if isinstance(exc, errors.CheckViolation):
@@ -309,7 +349,7 @@ class Store:
     @staticmethod
     async def _fetch(conn: Connection, item_id: str) -> Item | None:
         cur = await conn.cursor(row_factory=dict_row).execute(
-            "SELECT * FROM items WHERE id = %s", (item_id,)
+            sql.SQL("SELECT {} FROM items WHERE id = %s").format(_ITEM), (item_id,)
         )
         row = await cur.fetchone()
         return None if row is None else _item(row)
@@ -330,8 +370,8 @@ class Store:
     ) -> Item:
         """Change one open item, or raise the reason no row changed."""
         query = sql.SQL(
-            "UPDATE items SET {} WHERE id = %(id)s AND closed_at IS NULL RETURNING *"
-        ).format(assignments)
+            "UPDATE items SET {} WHERE id = %(id)s AND closed_at IS NULL RETURNING {}"
+        ).format(assignments, _ITEM)
         cur = await conn.cursor(row_factory=dict_row).execute(query, {**params, "id": item_id})
         row = await cur.fetchone()
         if row is None:
@@ -343,8 +383,14 @@ class Store:
 
         The existing item is returned as it is, with one exception: a new head SHA on a
         PR item is written to the existing item, since that is what a second push means
-        (not for the operator tier, which does not push).
+        (not for the operator tier, which does not push). What the new item was to wait on
+        is not added to the existing one: an item's edges are written with it and never
+        after.
         """
+        if len(new.after) > MAX_AFTER:
+            raise InvalidItem(f"an item waits on at most {MAX_AFTER} items, not {len(new.after)}")
+        if len(set(new.after)) != len(new.after):
+            raise InvalidItem("an item it is to wait on is named twice")
         subject = new.subject
         params: dict[str, Any] = {
             "assignee": new.assignee,
@@ -363,6 +409,7 @@ class Store:
             "created_by": caller.identity,
             "created_run": new.created_run or self._run_of(caller),
             "operator_typed": new.operator_typed,
+            "holds": new.holds,
         }
         for _ in range(_CREATE_ATTEMPTS):
             async with self._as(caller) as conn:
@@ -371,21 +418,24 @@ class Store:
                     INSERT INTO items (
                         id, assignee, subject_repo, subject_type, subject_ref, kind, fields,
                         machine, claimed_by, not_before, urgent, key, reasons, input_hash,
-                        created_by, created_run, operator_typed
+                        created_by, created_run, operator_typed, holds
                     ) VALUES (
                         %(id)s, %(assignee)s, %(subject_repo)s, %(subject_type)s,
                         %(subject_ref)s, %(kind)s, %(fields)s, %(machine)s, %(claimed_by)s,
                         %(not_before)s, %(urgent)s, %(key)s, %(reasons)s, %(input_hash)s,
-                        %(created_by)s, %(created_run)s, %(operator_typed)s
+                        %(created_by)s, %(created_run)s, %(operator_typed)s, %(holds)s
                     )
                     ON CONFLICT DO NOTHING
-                    RETURNING *
+                    RETURNING id
                     """,
                     {**params, "id": self._new_id()},
                 )
                 row = await cur.fetchone()
                 if row is not None:
-                    return Created(_item(row), existing=False)
+                    await self._add_after(conn, row["id"], new.after)
+                    item = await self._fetch(conn, row["id"])
+                    assert item is not None
+                    return Created(item, existing=False)
                 existing = await self._find_open_twin(conn, new)
                 if existing is None:
                     continue
@@ -403,12 +453,32 @@ class Store:
         raise StoreError(f"no free item ID after {_CREATE_ATTEMPTS} tries")
 
     @staticmethod
+    async def _add_after(conn: Connection, item_id: str, after: tuple[str, ...]) -> None:
+        """Write the edges of the item this transaction has just inserted.
+
+        The policy allows them for no other item. Raising here takes the item back too. An
+        item closed as rejected or replied is refused by the database, as an InvalidItem.
+        """
+        if not after:
+            return
+        cur = await conn.execute("SELECT id FROM items WHERE id = ANY(%s)", (list(after),))
+        known = {row[0] for row in await cur.fetchall()}
+        missing = [after_id for after_id in after if after_id not in known]
+        if missing:
+            raise ItemNotFound(f"no item {', '.join(missing)} to wait on")
+        await conn.execute(
+            "INSERT INTO item_after (item_id, after_id) SELECT %s, unnest(%s::text[])",
+            (item_id, list(after)),
+        )
+
+    @staticmethod
     async def _find_open_twin(conn: Connection, new: NewItem) -> Item | None:
         """The open item that one of the three uniqueness rules puts in the new one's way."""
         subject = new.subject
         cur = await conn.cursor(row_factory=dict_row).execute(
-            """
-            SELECT * FROM items
+            sql.SQL(
+                """
+            SELECT {} FROM items
             WHERE closed_at IS NULL AND (
                 key = %(key)s::text
                 OR (
@@ -427,7 +497,8 @@ class Store:
             )
             ORDER BY created_at
             LIMIT 1
-            """,
+            """
+            ).format(_ITEM),
             {
                 "key": new.key,
                 "kind": new.kind,
@@ -450,20 +521,26 @@ class Store:
     async def list_open(
         self, caller: Caller, *, assignee: str | None = None, include_deferred: bool = False
     ) -> list[Item]:
-        """The open items, urgent ones first, then the oldest.
+        """The open items: what can be done now before what waits, then urgent ones first,
+        then the oldest.
 
         An item whose `not_before` is still ahead is deferred: it is open, but left out
-        unless `include_deferred` is set.
+        unless `include_deferred` is set. A waiting item is not left out: the operator may
+        still reject it, and sees what it waits on.
         """
         async with self._as(caller) as conn:
             cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    """
+                SELECT * FROM (
+                    SELECT {} FROM items
+                    WHERE closed_at IS NULL
+                      AND (%(assignee)s::text IS NULL OR assignee = %(assignee)s::text)
+                      AND (%(include_deferred)s OR not_before IS NULL OR not_before <= now())
+                ) AS listed
+                ORDER BY cardinality(waiting_on) > 0, urgent DESC, created_at, id
                 """
-                SELECT * FROM items
-                WHERE closed_at IS NULL
-                  AND (%(assignee)s::text IS NULL OR assignee = %(assignee)s::text)
-                  AND (%(include_deferred)s OR not_before IS NULL OR not_before <= now())
-                ORDER BY urgent DESC, created_at, id
-                """,
+                ).format(_ITEM),
                 {"assignee": assignee, "include_deferred": include_deferred},
             )
             return [_item(row) for row in await cur.fetchall()]
@@ -475,7 +552,12 @@ class Store:
         resolution: Resolution,
         result: dict[str, Any] | None = None,
     ) -> Item:
-        """Close an open item. Raises NotClaimHolder when the policy refuses the caller."""
+        """Close an open item. Raises NotClaimHolder when the policy refuses the caller.
+
+        A waiting item is not closed as done or answered (ItemWaiting). Closing as rejected
+        or replied also closes, in the database, every open item down the chain that waits
+        on this one: `list_cascaded` names them.
+        """
         async with self._as(caller) as conn:
             return await self._update_open(
                 conn,
@@ -486,6 +568,27 @@ class Store:
                     "result": None if result is None else Jsonb(result),
                 },
             )
+
+    async def list_cascaded(self, caller: Caller, item_id: str) -> list[Item]:
+        """The items that closed because this one was rejected or replied to, oldest first.
+
+        A closer writes its own result, so the result alone proves nothing: the cascade's
+        items also closed in the transaction that closed this one, at the same moment.
+        """
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    """
+                SELECT {} FROM items
+                WHERE resolution = 'superseded'
+                  AND result @> %(cause)s
+                  AND closed_at = (SELECT closed_at FROM items AS first WHERE first.id = %(id)s)
+                ORDER BY created_at, id
+                """
+                ).format(_ITEM),
+                {"cause": Jsonb({"cause": "after", "item": item_id}), "id": item_id},
+            )
+            return [_item(row) for row in await cur.fetchall()]
 
     async def set_not_before(self, caller: Caller, item_id: str, when: datetime | None) -> Item:
         """Defer an open item, or with None end the deferral. The operator tier only."""
@@ -547,7 +650,10 @@ class Store:
         return _reply(row)
 
     async def reply_and_close(self, caller: Caller, item_id: str, body: str) -> tuple[Reply, Item]:
-        """Add a reply and close the item as replied, in one transaction: both or neither."""
+        """Add a reply and close the item as replied, in one transaction: both or neither.
+
+        What waits on the item closes with it, as after a reject (`list_cascaded`).
+        """
         try:
             async with self._as(caller) as conn:
                 cur = await conn.cursor(row_factory=dict_row).execute(
@@ -571,10 +677,19 @@ class Store:
         async with self._as(caller) as conn:
             cur = await conn.execute(
                 """
-                SELECT assignee, urgent, (not_before > now()) IS TRUE,
+                SELECT assignee, urgent, deferred, waiting,
                        count(*), min(extract(epoch FROM created_at))::float8
-                FROM items WHERE closed_at IS NULL
-                GROUP BY 1, 2, 3
+                FROM (
+                    SELECT assignee, urgent, created_at,
+                           (not_before > now()) IS TRUE AS deferred,
+                           EXISTS (
+                               SELECT FROM item_after AS a
+                               JOIN items AS before ON before.id = a.after_id
+                               WHERE a.item_id = items.id AND before.closed_at IS NULL
+                           ) AS waiting
+                    FROM items WHERE closed_at IS NULL
+                ) AS open_items
+                GROUP BY 1, 2, 3, 4
                 """
             )
             open_items = [OpenCount(*row) for row in await cur.fetchall()]

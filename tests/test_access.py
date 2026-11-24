@@ -79,6 +79,8 @@ def test_the_app_login_can_do_nothing_until_it_takes_a_tier(migrated: None, app_
         with pytest.raises(errors.InsufficientPrivilege):
             conn.execute("SELECT count(*) FROM replies")
         with pytest.raises(errors.InsufficientPrivilege):
+            conn.execute("SELECT count(*) FROM item_after")
+        with pytest.raises(errors.InsufficientPrivilege):
             conn.execute("SELECT set_pr_head_sha('hhhhhhhh', 'example/repo', '202', %s)", (SHA_A,))
 
 
@@ -341,7 +343,13 @@ def test_the_insert_policies_hold_without_the_column_grants(owner: psycopg.Conne
 
 @pytest.mark.parametrize("caller", TIERS, ids=lambda c: c.tier.name)
 def test_no_tier_deletes(app_url: str, held: dict[str, str], caller: Caller) -> None:
-    for statement in ("DELETE FROM items", "TRUNCATE items", "DELETE FROM replies"):
+    for statement in (
+        "DELETE FROM items",
+        "TRUNCATE items",
+        "DELETE FROM replies",
+        "DELETE FROM item_after",
+        "TRUNCATE item_after",
+    ):
         with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
             conn.execute(statement)
 
@@ -368,6 +376,8 @@ def test_no_tier_deletes(app_url: str, held: dict[str, str], caller: Caller) -> 
         "releases = 0",
         "reasons = '{}'",
         "input_hash = 'h'",
+        "holds = false",
+        "holds = true",
     ],
 )
 def test_no_tier_rewrites_what_an_item_is_or_says(
@@ -405,7 +415,8 @@ def test_the_update_grants_are_these_and_no_more(owner: psycopg.Connection) -> N
         "GROUP BY grantee, privilege_type ORDER BY grantee, privilege_type"
     ).fetchall()
     inserted = (
-        "assignee,claimed_by,created_by,created_run,fields,id,input_hash,key,kind,machine,"
+        "assignee,claimed_by,created_by,created_run,fields,holds,id,input_hash,key,kind,"
+        "machine,"
         "not_before,operator_typed,reasons,subject_ref,subject_repo,subject_type,urgent"
     )
     assert rows == [
@@ -642,6 +653,176 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
     assert "board_operator" not in acl
     assert "{=X" not in acl and ",=X" not in acl  # nothing for PUBLIC
     definers = owner.execute(
-        "SELECT proname FROM pg_proc WHERE prosecdef AND pronamespace = 'public'::regnamespace"
+        "SELECT proname FROM pg_proc WHERE prosecdef AND pronamespace = 'public'::regnamespace "
+        "ORDER BY proname"
     ).fetchall()
-    assert definers == [("set_pr_head_sha",)]
+    # The other one is a trigger's function, which nobody can call (the cascade, below).
+    assert definers == [("items_cascade_close",), ("set_pr_head_sha",)]
+
+
+# Waiting, the cascade and the edges
+
+EDGE = "INSERT INTO item_after (item_id, after_id) VALUES (%s, %s)"
+CLOSE_AS = "UPDATE items SET closed_at = now(), resolution = %s WHERE id = %s"
+
+
+def own(caller: Caller) -> str:
+    """The key in `held` of the item this caller may update."""
+    return "human:operator" if caller is OPERATOR else caller.identity
+
+
+@pytest.mark.parametrize("caller", [*TIERS, RUN, NIGHTLY], ids=lambda c: c.identity)
+@pytest.mark.parametrize("resolution", ["done", "answered"])
+def test_no_tier_closes_a_waiting_item_as_a_success(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str], caller: Caller, resolution: str
+) -> None:
+    """The caller's own item, which the policies let it close: the trigger refuses."""
+    item_id = held[own(caller)]
+    owner.execute(EDGE, (item_id, held["nobody"]))
+    before = row_of(owner, item_id)
+    with pytest.raises(psycopg.Error) as refused, as_tier(app_url, caller) as conn:
+        conn.execute(CLOSE_AS, (resolution, item_id))
+    assert refused.value.sqlstate == "BRD02"
+    assert f"item {item_id} waits on {held['nobody']} and cannot be closed" in str(refused.value)
+    assert row_of(owner, item_id) == before
+    # Once what it waits on is closed as a success, the same statement goes through.
+    owner.execute(CLOSE_AS, ("done", held["nobody"]))
+    with as_tier(app_url, caller) as conn:
+        assert conn.execute(CLOSE_AS, (resolution, item_id)).rowcount == 1
+
+
+@pytest.mark.parametrize("caller", [*TIERS, RUN], ids=lambda c: c.identity)
+@pytest.mark.parametrize("resolution", ["rejected", "replied", "superseded"])
+def test_every_tier_closes_its_waiting_item_as_anything_else(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str], caller: Caller, resolution: str
+) -> None:
+    item_id = held[own(caller)]
+    owner.execute(EDGE, (item_id, held["nobody"]))
+    with as_tier(app_url, caller) as conn:
+        assert conn.execute(CLOSE_AS, (resolution, item_id)).rowcount == 1
+
+
+@pytest.mark.parametrize("caller", [SESSION, RUN, RECONCILER], ids=lambda c: c.identity)
+@pytest.mark.parametrize("resolution", ["rejected", "replied"])
+def test_a_failure_closes_what_waits_on_it_whoever_holds_that(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str], caller: Caller, resolution: str
+) -> None:
+    """The caller may close neither of the two items down the chain; the cascade does."""
+    item_id, second, third = held[own(caller)], held["human:operator"], held["nobody"]
+    owner.execute(EDGE, (second, item_id))
+    owner.execute(EDGE, (third, second))
+    bystander = row_of(owner, held["process:nightly"])
+    with as_tier(app_url, caller) as conn:
+        for other in (second, third):
+            assert conn.execute(CLOSE_AS, ("superseded", other)).rowcount == 0
+        assert conn.execute(CLOSE_AS, (resolution, item_id)).rowcount == 1
+    rows = owner.execute(
+        "SELECT id, resolution, result, closed_at = (SELECT closed_at FROM items WHERE id = %s) "
+        "FROM items WHERE id = ANY(%s) ORDER BY id",
+        (item_id, [second, third]),
+    ).fetchall()
+    cause = {"cause": "after", "item": item_id, "resolution": resolution}
+    assert rows == sorted([(second, "superseded", cause, True), (third, "superseded", cause, True)])
+    assert row_of(owner, held["process:nightly"]) == bystander
+
+
+def test_the_cascade_is_the_owner_s_and_nobody_calls_it(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    row = owner.execute(
+        "SELECT prosecdef, proconfig, pg_get_userbyid(proowner), proacl::text "
+        "FROM pg_proc WHERE proname = 'items_cascade_close'"
+    ).fetchone()
+    assert row is not None
+    security_definer, config, function_owner, acl = row
+    assert security_definer is True
+    assert config == ["search_path=pg_catalog, pg_temp"]
+    assert function_owner == "board_owner"
+    assert acl == "{board_owner=X/board_owner}"
+    for caller in TIERS:
+        with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+            conn.execute("SELECT items_cascade_close()")
+
+
+@pytest.mark.parametrize("caller", [*TIERS, RUN], ids=lambda c: c.identity)
+def test_a_tier_adds_an_edge_only_with_an_item_it_is_writing(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str], caller: Caller
+) -> None:
+    mine = {"created_by": caller.identity, "created_run": run_of(caller)}
+    with as_tier(app_url, caller) as conn:
+        insert_row(conn, id="aaaaaaaa", **mine)
+        conn.execute(EDGE, ("aaaaaaaa", held["nobody"]))
+        conn.execute(EDGE, ("aaaaaaaa", held["human:operator"]))
+    edges = sorted([("aaaaaaaa", held["human:operator"]), ("aaaaaaaa", held["nobody"])])
+    assert owner.execute("SELECT * FROM item_after ORDER BY 1, 2").fetchall() == edges
+
+    # Not once the item is written: its own item of a moment ago is as closed to it ...
+    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+        conn.execute(EDGE, ("aaaaaaaa", held["process:nightly"]))
+    # ... as any older item, the one it holds included ...
+    for item_id in (held[own(caller)], held["nobody"], held["process:reconciler"]):
+        with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+            conn.execute(EDGE, (item_id, held["session:9z8y7x6w"]))
+    # ... and writing a new item opens no way to an edge on another.
+    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+        insert_row(conn, id="bbbbbbbb", **mine)
+        conn.execute(EDGE, (held["nobody"], "bbbbbbbb"))
+    assert owner.execute("SELECT * FROM item_after ORDER BY 1, 2").fetchall() == edges
+    assert owner.execute("SELECT count(*) FROM items WHERE id = 'bbbbbbbb'").fetchone() == (0,)
+
+
+def test_an_edge_on_another_caller_s_new_item_is_refused(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str]
+) -> None:
+    """Should board.actor change inside one transaction, the item's writer still decides."""
+    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, SESSION) as conn:
+        insert_row(conn, id="aaaaaaaa", created_by=SESSION.identity, created_run="0a1b2c3d")
+        conn.execute("SELECT set_config('board.actor', %s, true)", (OTHER_SESSION.identity,))
+        conn.execute(EDGE, ("aaaaaaaa", held["nobody"]))
+    assert owner.execute("SELECT count(*) FROM item_after").fetchone() == (0,)
+
+
+@pytest.mark.parametrize("caller", TIERS, ids=lambda c: c.tier.name)
+def test_every_tier_reads_the_edges_and_none_changes_one(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str], caller: Caller
+) -> None:
+    edge = (held[own(caller)], held["nobody"])
+    owner.execute(EDGE, edge)
+    with as_tier(app_url, caller) as conn:
+        assert conn.execute("SELECT * FROM item_after").fetchall() == [edge]
+    for statement in (
+        "UPDATE item_after SET after_id = 'pppppppp'",
+        "UPDATE item_after SET item_id = 'pppppppp'",
+        "DELETE FROM item_after",
+        "TRUNCATE item_after",
+    ):
+        with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+            conn.execute(statement)
+    assert owner.execute("SELECT * FROM item_after").fetchall() == [edge]
+
+
+def test_the_grants_on_the_edges_are_these_and_no_more(owner: psycopg.Connection) -> None:
+    rows = owner.execute(
+        "SELECT grantee, string_agg(privilege_type, ',' ORDER BY privilege_type) "
+        "FROM information_schema.table_privileges "
+        "WHERE table_name = 'item_after' AND grantee <> 'board_owner' "
+        "GROUP BY grantee ORDER BY grantee"
+    ).fetchall()
+    assert rows == [
+        ("board_agent", "INSERT,SELECT"),
+        ("board_operator", "INSERT,SELECT"),
+        ("board_process", "INSERT,SELECT"),
+    ]
+
+
+@pytest.mark.parametrize("caller", [*TIERS, RUN], ids=lambda c: c.identity)
+def test_a_tier_writes_holds_with_its_item_and_the_check_still_holds(
+    app_url: str, owner: psycopg.Connection, caller: Caller
+) -> None:
+    mine = {"created_by": caller.identity, "created_run": run_of(caller)}
+    with as_tier(app_url, caller) as conn:
+        insert_row(conn, id="aaaaaaaa", holds=False, **mine)
+    assert owner.execute("SELECT holds FROM items").fetchall() == [(False,)]
+    with pytest.raises(errors.CheckViolation) as refused, as_tier(app_url, caller) as conn:
+        insert_row(conn, id="bbbbbbbb", holds=False, subject_type="pr", subject_ref="202", **mine)
+    assert refused.value.diag.constraint_name == "items_holds_false_on_operator_issue"
