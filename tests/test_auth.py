@@ -36,19 +36,27 @@ from factory_board.auth import (
     identity_resolver,
     postgres_store,
 )
-from factory_board.config import CLAUDE_REDIRECT, ServerSettings
+from factory_board.config import CLAUDE_REDIRECT, ConfigError, ServerSettings
 from factory_board.store import Tier
 
 BASE = "https://board.example.test"
 ROUTE_HEADER = "X-Board-Route"
 SESSION_TOKEN = "session-token-for-tests"
 NIGHTLY_TOKEN = "nightly-token-for-tests"
+RECONCILER_TOKEN = "reconciler-token-for-tests"
 GROUP = "factory-operators"
 ALLOWED = (CLAUDE_REDIRECT, "http://localhost:*")
 
 PRIVATE = {ROUTE_HEADER: "private"}
 AS_SESSION = {"Authorization": f"Bearer {SESSION_TOKEN}"}
 AS_NIGHTLY = {"Authorization": f"Bearer {NIGHTLY_TOKEN}"}
+AS_RECONCILER = {"Authorization": f"Bearer {RECONCILER_TOKEN}"}
+# No static token configured: the login proxy stands alone.
+NO_STATIC_TOKEN: dict[str, Any] = {
+    "session_token_sha256": None,
+    "nightly_token_sha256": None,
+    "reconciler_token_sha256": None,
+}
 ACCEPT = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
 INIT: dict[str, Any] = {
     "jsonrpc": "2.0",
@@ -117,6 +125,7 @@ def settings(issuer: str) -> ServerSettings:
         operator="olive",
         session_token_sha256=sha256(SESSION_TOKEN),
         nightly_token_sha256=sha256(NIGHTLY_TOKEN),
+        reconciler_token_sha256=sha256(RECONCILER_TOKEN),
     )
 
 
@@ -207,7 +216,10 @@ def refused(token: str) -> float:
         {"X-Other-Route": "private"},
     ],
 )
-@pytest.mark.parametrize(("name", "token"), [("session", AS_SESSION), ("nightly", AS_NIGHTLY)])
+@pytest.mark.parametrize(
+    ("name", "token"),
+    [("session", AS_SESSION), ("nightly", AS_NIGHTLY), ("reconciler", AS_RECONCILER)],
+)
 async def test_a_static_token_is_refused_off_the_private_route(
     settings: ServerSettings, headers: dict[str, str], name: str, token: dict[str, str]
 ) -> None:
@@ -242,6 +254,7 @@ async def test_a_wrong_token_is_refused_on_the_private_route(settings: ServerSet
         # The configured hash is not the token.
         sha256(SESSION_TOKEN),
         sha256(NIGHTLY_TOKEN),
+        sha256(RECONCILER_TOKEN),
     ]
     async with served(settings) as (client, _, _):
         for token in wrong:
@@ -289,6 +302,48 @@ async def test_the_nightly_token_is_the_nightly_whatever_it_says(settings: Serve
     }
 
 
+async def test_the_reconciler_token_is_the_reconciler_whatever_it_says(
+    settings: ServerSettings,
+) -> None:
+    async with served(settings) as (client, _, _):
+        result = await whoami(client, PRIVATE | AS_RECONCILER | {SESSION_HEADER: "0a1b2c3d"})
+        bare = await whoami(client, PRIVATE | AS_RECONCILER)
+    assert told(result) == {
+        "tier": "board_process",
+        "identity": "process:reconciler",
+        "operator_typed": False,
+    }
+    assert told(bare) == told(result)
+
+
+async def test_the_reconciler_token_is_off_until_configured(settings: ServerSettings) -> None:
+    async with served(settings, reconciler_token_sha256=None) as (client, _, _):
+        response = await client.post("/mcp", json=INIT, headers=ACCEPT | PRIVATE | AS_RECONCILER)
+        assert response.status_code == 401
+        # The nightly's token is still the nightly's, and nothing more.
+        result = await whoami(client, PRIVATE | AS_NIGHTLY)
+        assert told(result)["identity"] == "process:nightly"
+
+    # And it works with no other static token configured.
+    async with served(settings, session_token_sha256=None, nightly_token_sha256=None) as (
+        client,
+        _,
+        _,
+    ):
+        result = await whoami(client, PRIVATE | AS_RECONCILER)
+        assert told(result)["identity"] == "process:reconciler"
+        for other in (AS_SESSION, AS_NIGHTLY):
+            response = await client.post("/mcp", json=INIT, headers=ACCEPT | PRIVATE | other)
+            assert response.status_code == 401
+
+
+@pytest.mark.parametrize("other", ["session_token_sha256", "nightly_token_sha256"])
+def test_two_static_tokens_with_one_hash_are_refused(settings: ServerSettings, other: str) -> None:
+    """One token for two identities would give each the other's tools."""
+    with pytest.raises(ConfigError, match="must differ"):
+        replace(settings, reconciler_token_sha256=getattr(settings, other))
+
+
 async def test_an_unconfigured_token_is_off(settings: ServerSettings) -> None:
     async with served(settings, nightly_token_sha256=None) as (client, _, _):
         response = await client.post("/mcp", json=INIT, headers=ACCEPT | PRIVATE | AS_NIGHTLY)
@@ -296,7 +351,7 @@ async def test_an_unconfigured_token_is_off(settings: ServerSettings) -> None:
         result = await whoami(client, PRIVATE | AS_SESSION | {SESSION_HEADER: "0a1b2c3d"})
         assert told(result)["identity"] == "session:0a1b2c3d"
 
-    async with served(settings, nightly_token_sha256=None, session_token_sha256=None) as (
+    async with served(settings, **NO_STATIC_TOKEN) as (
         client,
         _,
         auth,
@@ -345,7 +400,7 @@ async def test_registration_admits_only_the_allowed_redirects_and_stores_encrypt
 
 
 async def test_pocket_id_does_not_get_the_resource(settings: ServerSettings) -> None:
-    async with served(settings, session_token_sha256=None, nightly_token_sha256=None) as (
+    async with served(settings, **NO_STATIC_TOKEN) as (
         _,
         _,
         auth,
