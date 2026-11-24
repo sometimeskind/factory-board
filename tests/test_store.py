@@ -15,6 +15,7 @@ from helpers import (
     OPERATOR,
     OTHER_SESSION,
     RECONCILER,
+    REPO,
     RUN,
     SESSION,
     SHA_A,
@@ -744,6 +745,27 @@ async def test_the_stats_count_the_waiting_apart(store: Store) -> None:
         ("operator", True, False, False): 1,
         ("work", False, False, False): 1,
     }
+
+
+async def test_the_stats_count_per_issue_the_operators_items_that_hold(store: Store) -> None:
+    def per_issue(stats: Stats) -> dict[tuple[str, str], int]:
+        return {(i.repo, i.issue): i.count for i in stats.issues}
+
+    first = (await store.create_item(SESSION, manual(101))).item
+    # Waiting and deferred items count: the issue is the operator's either way.
+    await after(store, manual(101), first.id)
+    later = (await store.create_item(SESSION, manual(102))).item
+    await store.set_not_before(OPERATOR, later.id, datetime.now(UTC) + timedelta(days=2))
+    # These don't: an item that doesn't hold, a stage's item, a PR's, one with no issue.
+    await store.create_item(SESSION, replace(manual(103), holds=False))
+    await store.create_item(RECONCILER, stage("work", 104))
+    await store.create_item(RECONCILER, pr_approve(202))
+    await store.create_item(NIGHTLY, keyed())
+    assert per_issue(await store.stats(RECONCILER)) == {(REPO, "101"): 2, (REPO, "102"): 1}
+
+    await store.close_item(OPERATOR, first.id, Resolution.DONE)
+    await store.close_item(OPERATOR, later.id, Resolution.DONE)
+    assert per_issue(await store.stats(RECONCILER)) == {(REPO, "101"): 1}
 
 
 # Deferring and bumping are the operator's

@@ -248,9 +248,19 @@ class ClosedCount:
 
 
 @dataclass(frozen=True)
+class IssueCount:
+    """The operator's open items on one issue that hold it, deferred and waiting ones included."""
+
+    repo: str
+    issue: str
+    count: int
+
+
+@dataclass(frozen=True)
 class Stats:
     open: tuple[OpenCount, ...]
     closed: tuple[ClosedCount, ...]
+    issues: tuple[IssueCount, ...]
 
 
 def new_item_id() -> str:
@@ -673,7 +683,7 @@ class Store:
         return _reply(row), item
 
     async def stats(self, caller: Caller) -> Stats:
-        """Counts for the metrics: the open items and the closed ones, and no item's text."""
+        """Counts for the metrics: open items, closed ones and per issue, and no item's text."""
         async with self._as(caller) as conn:
             cur = await conn.execute(
                 """
@@ -701,7 +711,19 @@ class Store:
                 """
             )
             closed_items = [ClosedCount(*row) for row in await cur.fetchall()]
-        return Stats(tuple(open_items), tuple(closed_items))
+            # An issue waits on the operator while one of these is open. A deferred or a
+            # waiting item still counts: the issue is the operator's either way.
+            cur = await conn.execute(
+                """
+                SELECT subject_repo, subject_ref, count(*)
+                FROM items
+                WHERE closed_at IS NULL AND assignee = 'operator'
+                      AND subject_type = 'issue' AND holds
+                GROUP BY 1, 2
+                """
+            )
+            issues = [IssueCount(*row) for row in await cur.fetchall()]
+        return Stats(tuple(open_items), tuple(closed_items), tuple(issues))
 
     async def list_replies(self, caller: Caller, item_id: str) -> list[Reply]:
         """An item's replies, oldest first."""

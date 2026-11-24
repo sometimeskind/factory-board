@@ -147,7 +147,9 @@ port of their own. A tool outside the caller's row is refused.
   An item closed by a cascade gets a line of its own, with the verb `cascade`.
 - The metrics are read from the database every 30 seconds: `factory_board_open_items` and
   `factory_board_oldest_open_item_created_timestamp_seconds` (by assignee, urgent,
-  deferred, waiting), `factory_board_closed_items` (by assignee, resolution), and
+  deferred, waiting), `factory_board_closed_items` (by assignee, resolution),
+  `factory_board_issue_open_items` (by repo and issue: the operator's open items that hold
+  that issue, deferred and waiting ones included; an issue with none has no series) and
   `factory_board_tool_calls_total`.
 
 ## Settings
