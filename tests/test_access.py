@@ -137,7 +137,9 @@ def test_every_tier_reads_every_item(app_url: str, held: dict[str, str], caller:
         (RECONCILER, "process:nightly", False),
         (RECONCILER, "human:operator", False),
         (RECONCILER, "session:0a1b2c3d", False),
-        (RECONCILER, "nobody", False),
+        # The reconciler closes a stage item nobody holds; no other process does.
+        (RECONCILER, "nobody", True),
+        (NIGHTLY, "nobody", False),
         (NIGHTLY, "process:nightly", True),
         (NIGHTLY, "process:reconciler", False),
     ],
@@ -657,7 +659,11 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
         "ORDER BY proname"
     ).fetchall()
     # The other one is a trigger's function, which nobody can call (the cascade, below).
-    assert definers == [("items_cascade_close",), ("set_pr_head_sha",)]
+    assert definers == [
+        ("items_cascade_close",),
+        ("merge_assess_trigger",),
+        ("set_pr_head_sha",),
+    ]
 
 
 # Waiting, the cascade and the edges
@@ -714,6 +720,9 @@ def test_a_failure_closes_what_waits_on_it_whoever_holds_that(
     bystander = row_of(owner, held["process:nightly"])
     with as_tier(app_url, caller) as conn:
         for other in (second, third):
+            if caller is RECONCILER and other == third:
+                # The reconciler may close an unheld stage item itself; the cascade still does.
+                continue
             assert conn.execute(CLOSE_AS, ("superseded", other)).rowcount == 0
         assert conn.execute(CLOSE_AS, (resolution, item_id)).rowcount == 1
     rows = owner.execute(

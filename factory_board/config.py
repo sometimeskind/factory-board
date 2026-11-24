@@ -68,7 +68,7 @@ CLAUDE_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
 class ServerSettings:
     """What the server needs to know who is calling. All of it is required to serve.
 
-    The operator signs in through Pocket ID and must be in `operator_group`. The two static
+    The operator signs in through Pocket ID and must be in `operator_group`. The static
     tokens are configured as SHA-256 hashes only, and are accepted only on a request whose
     `route_header` says `private`: the private HTTPRoute sets that header, overwriting
     whatever the client sent, and the public one sets `public`.
@@ -86,9 +86,11 @@ class ServerSettings:
     # The operator's Pocket ID username: a new item for the operator is held by
     # `human:<operator>`, whoever wrote it.
     operator: str
-    # Interactive sessions on pilot share one token; the nightly has its own.
+    # Interactive sessions on pilot share one token; the nightly and the reconciler have
+    # one each.
     session_token_sha256: str | None = None
     nightly_token_sha256: str | None = None
+    reconciler_token_sha256: str | None = None
     # "" binds every address of both families (uvicorn makes "::" IPv6-only).
     host: str = ""
     port: int = 8000
@@ -97,17 +99,21 @@ class ServerSettings:
     def __post_init__(self) -> None:
         if not _IDENTITY_NAME.fullmatch(self.operator):
             raise ConfigError("FACTORY_BOARD_OPERATOR is not a username")
-        for name, value in (
+        hashes = (
             ("FACTORY_BOARD_SESSION_TOKEN_SHA256", self.session_token_sha256),
             ("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256", self.nightly_token_sha256),
-        ):
-            if value is not None and not _SHA256_HEX.fullmatch(value):
+            ("FACTORY_BOARD_RECONCILER_TOKEN_SHA256", self.reconciler_token_sha256),
+        )
+        seen: dict[str, str] = {}
+        for name, value in hashes:
+            if value is None:
+                continue
+            if not _SHA256_HEX.fullmatch(value):
                 raise ConfigError(f"{name} must be 64 lower-case hex characters")
-        if (
-            self.session_token_sha256 is not None
-            and self.session_token_sha256 == self.nightly_token_sha256
-        ):
-            raise ConfigError("the session token and the nightly token must differ")
+            # One token for two identities would give each the other's tools.
+            if value in seen:
+                raise ConfigError(f"{seen[value]} and {name} must differ")
+            seen[value] = name
         if not _HEADER_NAME.fullmatch(self.route_header):
             raise ConfigError("FACTORY_BOARD_ROUTE_HEADER is not a header name")
         if not self.allowed_redirects:
@@ -149,4 +155,5 @@ class ServerSettings:
             metrics_port=port("FACTORY_BOARD_METRICS_PORT", 9090),
             session_token_sha256=optional("FACTORY_BOARD_SESSION_TOKEN_SHA256"),
             nightly_token_sha256=optional("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256"),
+            reconciler_token_sha256=optional("FACTORY_BOARD_RECONCILER_TOKEN_SHA256"),
         )

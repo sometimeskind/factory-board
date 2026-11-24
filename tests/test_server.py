@@ -12,17 +12,18 @@ from typing import Any
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from helpers import NIGHTLY, OPERATOR, REPO, SESSION, SHA_A, SHA_B
+from helpers import NIGHTLY, OPERATOR, RECONCILER, REPO, RUN, SESSION, SHA_A, SHA_B
 from prometheus_client import REGISTRY
 
 from factory_board import metrics
 from factory_board.auth import Identity
-from factory_board.server import build_server
+from factory_board.server import build_server, who
 from factory_board.store import Caller, Store, Tier
 
 AS_OPERATOR = Identity(OPERATOR, operator_typed=True)
 AS_SESSION = Identity(SESSION, operator_typed=True)
 AS_NIGHTLY = Identity(NIGHTLY, operator_typed=False)
+AS_RECONCILER = Identity(RECONCILER, operator_typed=False)
 
 TICKET = {"repo": REPO, "number": 101}
 MANUAL: dict[str, Any] = {
@@ -54,10 +55,21 @@ KEYED: dict[str, Any] = {
 }
 KEY = "finding:widget-press-hot"
 
+ASSESS: dict[str, Any] = {"kind": "assess", "issue": TICKET}
+REVIEW: dict[str, Any] = {"kind": "review", "repo": REPO, "number": 202, "head_sha": SHA_A}
+DEPLOY_CHECK: dict[str, Any] = {
+    "kind": "deploy-check",
+    "repo": REPO,
+    "number": 202,
+    "merge_sha": SHA_B,
+}
+
+READS = {"get_item", "list_pipeline_items", "list_assessments"}
 TOOLS = {
-    Tier.OPERATOR: {"list_items", "get_item", "done", "answer", "reply", "defer", "reject", "bump"},
-    Tier.AGENT: {"create_item", "list_items", "get_item", "update_pr_head"},
-    Tier.PROCESS: {"create_keyed_item", "list_own_items", "close_own_item"},
+    "operator": {"list_items", "done", "answer", "reply", "defer", "reject", "bump"} | READS,
+    "session": {"create_item", "list_items", "update_pr_head"} | READS,
+    "nightly": {"create_keyed_item", "list_own_items", "close_own_item"},
+    "reconciler": {"write_stage_item", "write_operator_item", "close_for_fact"} | READS,
 }
 AHEAD = (datetime.now(UTC) + timedelta(days=2)).isoformat()
 # One call per tool that passes validation; the ID names no item.
@@ -75,6 +87,11 @@ CALLS: dict[str, dict[str, Any]] = {
     "create_keyed_item": {"key": KEY, "item": KEYED},
     "list_own_items": {},
     "close_own_item": {"item_id": "abcdefgh"},
+    "list_pipeline_items": {},
+    "list_assessments": {"repo": REPO},
+    "write_stage_item": {"item": ASSESS},
+    "write_operator_item": {"item": PR_APPROVE},
+    "close_for_fact": {"item_id": "abcdefgh", "cause": "merged"},
 }
 
 
@@ -111,11 +128,11 @@ async def test_the_tools_are_the_three_rows(board: Board) -> None:
     assert names == set().union(*TOOLS.values()) == set(CALLS)
 
 
-@pytest.mark.parametrize("identity", [AS_OPERATOR, AS_SESSION, AS_NIGHTLY])
+@pytest.mark.parametrize("identity", [AS_OPERATOR, AS_SESSION, AS_NIGHTLY, AS_RECONCILER])
 async def test_a_tool_outside_the_tier_s_row_is_refused(
     board: Board, store: Store, identity: Identity
 ) -> None:
-    for tool in sorted(set(CALLS) - TOOLS[identity.caller.tier]):
+    for tool in sorted(set(CALLS) - TOOLS[who(identity)]):
         with pytest.raises(ToolError, match="not a tool of this caller's tier"):
             await board.call(identity, tool, **CALLS[tool])
     assert await store.list_open(OPERATOR, include_deferred=True) == []
@@ -518,3 +535,175 @@ async def test_the_metrics_count_items_and_carry_no_text(board: Board, store: St
     assert open_items("true", "false") is None
     assert open_items("false", "false", "true") is None
     assert issue_items(101) is None
+
+
+# ---- the reconciler ----
+
+
+async def pipeline(board: Board, **arguments: Any) -> list[dict[str, Any]]:
+    return (await board.call(AS_RECONCILER, "list_pipeline_items", **arguments))["items"]
+
+
+async def test_the_two_processes_do_not_share_their_tools(board: Board) -> None:
+    assert who(AS_NIGHTLY) == "nightly"
+    assert who(AS_RECONCILER) == "reconciler"
+    assert who(Identity(RUN, operator_typed=False)) == "session"
+    with pytest.raises(ToolError, match="not a tool of this caller's tier"):
+        await board.call(AS_NIGHTLY, "write_stage_item", item=ASSESS)
+    with pytest.raises(ToolError, match="not a tool of this caller's tier"):
+        await board.call(AS_RECONCILER, "create_keyed_item", key=KEY, item=KEYED)
+
+
+async def test_a_stage_item_is_held_by_nobody_and_open_once(board: Board) -> None:
+    created = await board.call(AS_RECONCILER, "write_stage_item", item=REVIEW, urgent=True)
+    item = created["item"]
+    assert (created["status"], created["confirmation"]) == ("created", f"review for pr {REPO}#202")
+    assert (item["assignee"], item["held_by"], item["urgent"]) == ("review", None, True)
+    assert item["fields"] == REVIEW
+    again = await board.call(AS_RECONCILER, "write_stage_item", item=REVIEW | {"head_sha": SHA_B})
+    assert (again["status"], again["item"]["id"]) == ("already open", item["id"])
+    # The open item keeps the commit it was written for: a new head is a close and a write.
+    assert again["item"]["fields"]["head_sha"] == SHA_A
+    # Not on the operator's list, and in the queue for every reader.
+    assert (await board.call(AS_OPERATOR, "list_items"))["items"] == []
+    for reader in (AS_OPERATOR, AS_SESSION, AS_RECONCILER):
+        listed = await board.call(reader, "list_pipeline_items")
+        assert [entry["id"] for entry in listed["items"]] == [item["id"]]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"item": REVIEW, "reasons": ["new"]},
+        {"item": REVIEW, "closed_as": "nothing-to-deploy"},
+        {"item": ASSESS, "reasons": ["new", "new"]},
+        {"item": ASSESS, "reasons": ["because"]},
+        {"item": ASSESS, "not_before": "2999-01-01T00:00:00"},
+        {"item": ASSESS | {"note": "one\ntwo"}},
+        {"item": REVIEW | {"head_sha": "abc"}},
+        {"item": {"kind": "retro"}},
+        {"item": MANUAL},
+        {"item": ASSESS, "claimed_by": RECONCILER.identity},
+    ],
+)
+async def test_a_stage_item_is_checked(board: Board, bad: dict[str, Any]) -> None:
+    with pytest.raises(ToolError):
+        await board.call(AS_RECONCILER, "write_stage_item", **bad)
+    assert await pipeline(board) == []
+
+
+async def test_a_second_trigger_merges_into_the_open_assess_item(board: Board) -> None:
+    later = (datetime.now(UTC) + timedelta(minutes=30)).isoformat()
+    sooner = datetime.now(UTC) + timedelta(minutes=10)
+    first = await board.call(
+        AS_RECONCILER, "write_stage_item", item=ASSESS, not_before=later, reasons=["new"]
+    )
+    item_id = first["item"]["id"]
+    merged = await board.call(
+        AS_RECONCILER,
+        "write_stage_item",
+        item=ASSESS,
+        not_before=sooner.isoformat(),
+        reasons=["changed", "new"],
+    )
+    assert (merged["status"], merged["item"]["id"]) == ("already open", item_id)
+    assert merged["item"]["reasons"] == ["new", "changed"]
+    assert datetime.fromisoformat(merged["item"]["deferred_until"]) == sooner
+    # A later date does not move it back, and no date is the earliest.
+    again = await board.call(AS_RECONCILER, "write_stage_item", item=ASSESS, not_before=later)
+    assert datetime.fromisoformat(again["item"]["deferred_until"]) == sooner
+    now = await board.call(AS_RECONCILER, "write_stage_item", item=ASSESS, reasons=["reopened"])
+    assert now["item"]["deferred_until"] is None
+    assert now["item"]["reasons"] == ["new", "changed", "reopened"]
+    assert [entry["id"] for entry in await pipeline(board)] == [item_id]
+
+
+async def test_a_trigger_does_nothing_to_an_assess_item_a_run_holds(
+    board: Board, conn: Any
+) -> None:
+    created = await board.call(AS_RECONCILER, "write_stage_item", item=ASSESS, reasons=["new"])
+    item_id = created["item"]["id"]
+    conn.execute("UPDATE items SET claimed_by = %s WHERE id = %s", (RUN.identity, item_id))
+    again = await board.call(AS_RECONCILER, "write_stage_item", item=ASSESS, reasons=["changed"])
+    assert (again["item"]["held_by"], again["item"]["reasons"]) == (RUN.identity, ["new"])
+    with pytest.raises(ToolError, match=f"held by {RUN.identity}"):
+        await board.call(AS_RECONCILER, "close_for_fact", item_id=item_id, cause="issue-closed")
+
+
+async def test_a_deploy_check_can_be_written_closed(board: Board) -> None:
+    created = await board.call(
+        AS_RECONCILER, "write_stage_item", item=DEPLOY_CHECK, closed_as="nothing-to-deploy"
+    )
+    item = created["item"]
+    assert (item["open"], item["resolution"]) == (False, "done")
+    assert item["result"] == {"outcome": "nothing-to-deploy"}
+    assert await pipeline(board) == []
+    since = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    assert [entry["id"] for entry in await pipeline(board, closed_since=since)] == [item["id"]]
+    assert await pipeline(board, closed_since=since, repo="example/other") == []
+
+
+async def test_the_reconciler_holds_a_pr_item_and_closes_it_for_the_fact(board: Board) -> None:
+    created = await board.call(AS_RECONCILER, "write_operator_item", item=PR_APPROVE)
+    item_id = created["item"]["id"]
+    assert created["item"]["held_by"] == RECONCILER.identity
+    assert [entry["id"] for entry in (await board.call(AS_OPERATOR, "list_items"))["items"]] == [
+        item_id
+    ]
+    with pytest.raises(ToolError, match=f"held by {RECONCILER.identity}"):
+        await board.call(AS_OPERATOR, "done", item_id=item_id)
+    closed = await board.call(
+        AS_RECONCILER, "close_for_fact", item_id=item_id, cause="approved", superseded=False
+    )
+    assert closed["status"] == "done"
+    item = await board.call(AS_OPERATOR, "get_item", item_id=item_id)
+    assert (item["resolution"], item["result"]) == ("done", {"cause": "approved"})
+
+
+async def test_the_reconciler_s_other_items_are_the_operator_s(board: Board) -> None:
+    created = await board.call(AS_RECONCILER, "write_operator_item", item=DECISION)
+    item_id = created["item"]["id"]
+    assert created["item"]["held_by"] == OPERATOR.identity
+    assert created["item"]["operator_typed"] is False
+    # It sees what it wrote, and can't close it.
+    assert [entry["id"] for entry in await pipeline(board)] == [item_id]
+    with pytest.raises(ToolError, match=f"held by {OPERATOR.identity}"):
+        await board.call(AS_RECONCILER, "close_for_fact", item_id=item_id, cause="pr-reopened")
+    # A session's item is not in the reconciler's list.
+    await board.create(numbered(MANUAL, 102))
+    assert [entry["id"] for entry in await pipeline(board)] == [item_id]
+
+
+async def test_a_stage_item_closes_as_superseded_only(board: Board) -> None:
+    created = await board.call(AS_RECONCILER, "write_stage_item", item=REVIEW)
+    item_id = created["item"]["id"]
+    with pytest.raises(ToolError, match="closed as done by its run only"):
+        await board.call(
+            AS_RECONCILER, "close_for_fact", item_id=item_id, cause="merged", superseded=False
+        )
+    with pytest.raises(ToolError):
+        await board.call(AS_RECONCILER, "close_for_fact", item_id=item_id, cause="not a name")
+    await board.call(AS_RECONCILER, "close_for_fact", item_id=item_id, cause="head-moved")
+    item = await board.call(AS_RECONCILER, "get_item", item_id=item_id)
+    assert (item["resolution"], item["result"]) == ("superseded", {"cause": "head-moved"})
+    # The subject is free again.
+    again = await board.call(AS_RECONCILER, "write_stage_item", item=REVIEW)
+    assert again["status"] == "created"
+
+
+async def test_the_last_assessment_of_each_issue(board: Board, conn: Any) -> None:
+    assert (await board.call(AS_RECONCILER, "list_assessments", repo=REPO))["items"] == []
+    ids: list[str] = []
+    for input_hash in ("h1", "h2"):
+        created = await board.call(AS_RECONCILER, "write_stage_item", item=ASSESS)
+        ids.append(created["item"]["id"])
+        conn.execute(
+            "UPDATE items SET closed_at = now(), resolution = 'done', input_hash = %s, "
+            "result = %s WHERE id = %s",
+            (input_hash, '{"outcome": "none"}', ids[-1]),
+        )
+    other = ASSESS | {"issue": {"repo": REPO, "number": 102}}
+    await board.call(AS_RECONCILER, "write_stage_item", item=other)
+    listed = (await board.call(AS_SESSION, "list_assessments", repo=REPO))["items"]
+    assert [(entry["id"], entry["input_hash"]) for entry in listed] == [(ids[1], "h2")]
+    assert listed[0]["result"] == {"outcome": "none"}

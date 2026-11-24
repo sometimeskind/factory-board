@@ -365,7 +365,9 @@ async def test_two_creates_at_once_make_one_item(migrated: None, app_url: str) -
         (RECONCILER, "process:nightly", False),
         (RECONCILER, "human:operator", False),
         (RECONCILER, "session:0a1b2c3d", False),
-        (RECONCILER, None, False),
+        # The reconciler closes a stage item nobody holds; no other process does.
+        (RECONCILER, None, True),
+        (NIGHTLY, None, False),
         (NIGHTLY, "process:nightly", True),
         (NIGHTLY, "process:reconciler", False),
     ],
