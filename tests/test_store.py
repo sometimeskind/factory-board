@@ -666,6 +666,17 @@ async def test_an_item_can_follow_a_success_but_not_a_failure(
     assert (second.after, second.waiting_on) == ((first.id,), ())
 
 
+async def test_an_item_cannot_follow_one_the_cascade_closed(store: Store, pool: Pool) -> None:
+    first = (await store.create_item(SESSION, manual(101))).item
+    second = (await store.create_item(SESSION, replace(manual(102), after=(first.id,)))).item
+    await store.close_item(OPERATOR, first.id, Resolution.REJECTED)
+    with pytest.raises(
+        InvalidItem, match=f"item {second.id} was closed as superseded by a cascade, so nothing"
+    ):
+        await store.create_item(SESSION, replace(manual(103), after=(second.id,)))
+    assert await count(pool) == 2
+
+
 async def test_what_an_item_is_after_must_be_other_items_and_few(pool: Pool) -> None:
     ids = iter("abcdefghjkmnpqrstuvwxyz")
     store = Store(pool, new_id=lambda: next(ids) * 8)

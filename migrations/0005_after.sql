@@ -67,9 +67,16 @@ DECLARE
     failed text;
 BEGIN
     PERFORM pg_advisory_xact_lock(5, 1);
-    SELECT i.resolution INTO failed
+    -- An item the cascade closed counts as failed too: what it waited on was refused.
+    SELECT CASE WHEN i.resolution = 'superseded' THEN 'superseded by a cascade'
+                ELSE i.resolution END
+        INTO failed
         FROM public.items AS i
-        WHERE i.id = NEW.after_id AND i.resolution IN ('rejected', 'replied');
+        WHERE i.id = NEW.after_id
+          AND (
+              i.resolution IN ('rejected', 'replied')
+              OR (i.resolution = 'superseded' AND i.result ->> 'cause' = 'after')
+          );
     IF FOUND THEN
         RAISE EXCEPTION 'item % was closed as %, so nothing can wait on it', NEW.after_id, failed
             USING ERRCODE = 'check_violation';
