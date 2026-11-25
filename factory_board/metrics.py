@@ -64,6 +64,8 @@ RECONCILER_PASS = Gauge(
     "factory_board_reconciler_pass_timestamp_seconds",
     "When the reconciler last recorded a finished pass",
 )
+# 1 while the operator's pause stands: the dispatcher then starts only health and digest.
+PAUSED = Gauge("factory_board_paused", "Whether the factory is paused (1) or not (0)")
 LAST_REFRESH = Gauge(
     "factory_board_metrics_refresh_timestamp_seconds",
     "When the item gauges were last read from the database",
@@ -107,4 +109,5 @@ def show(stats: Stats) -> None:
         CLAIMS.labels(row.stage, row.ending, row.reason).set(row.count)
     FIX_FORWARD_ISSUES.set(stats.at_fix_forward_limit)
     RECONCILER_PASS.set(stats.reconciler_pass or 0)
+    PAUSED.set(1 if stats.paused else 0)
     LAST_REFRESH.set_to_current_time()

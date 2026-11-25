@@ -13,7 +13,7 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 - A migration creates no role. It grants to the roles and writes policies for them, and
   `0001` stops with a clear message when one is missing ([Roles](../README.md#roles)).
 - The migrations run as the tables' owner. `items`, `replies`, `item_after`, `claims`,
-  `operator_acts` and `heartbeats` are under
+  `operator_acts`, `heartbeats` and `pause` are under
   `FORCE ROW LEVEL SECURITY`, so the owner reads and writes them through the `*_owner`
   policies; a new table under row security needs one too, or a later migration's `UPDATE` on
   it changes no row and says nothing.
@@ -31,5 +31,6 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 | `0007_reconciler.sql` | The reconciler's policy (it closes a stage item nobody holds) and `merge_assess_trigger` |
 | `0008_claims.sql` | The `claims` table (one row per claim, with the run token's hash); the `claimable` view, which is the queue's order; `claim_item`, `release_claim` and `expire_claims` for the dispatcher, with the decision item after two expiries in a row; `run_of_token` |
 | `0009_board_triggers.sql` | What the board does by itself: the trigger that wakes assess when the operator's last item or the last `deploy-check` on an issue closes, and `pending_reasons` for a wake that meets a held `assess` item; `operator_acts` (when the operator last acted on an issue) and the fix-forward limit that counts from it (`fix_forward`, SQLSTATE `BRD04`); the `heartbeats` table and `record_heartbeat` |
+| `0010_pause.sql` | The pause flag: the one-row `pause` table, and `set_pause` and `lift_pause` for the operator |
 
 The `schema_migrations` table is created by the runner itself.

@@ -134,7 +134,7 @@ port of their own. A tool outside the caller's row is refused.
 
 | Tier | Tools |
 |---|---|
-| Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump` |
+| Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump`, `pause`, `resume` |
 | Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
 | Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `list_items`, `get_item`, `list_pipeline_items`, `list_assessments` |
@@ -159,6 +159,22 @@ the operator's is not orphaned.
   `items_update_reconciler` allows the second for `process:reconciler` alone.
 - `heartbeat` records that a pass finished, at the database's time (`record_heartbeat`,
   for `process:reconciler` alone). The metrics export it.
+
+### The pause flag
+
+The operator stops the factory from starting work with `pause` (a reason of at most 500
+characters) and lifts the stop with `resume`. The flag is the one row of the `pause` table
+(`migrations/0010_pause.sql`): there while the factory is paused, with since when, by whom
+and why.
+
+- The board only keeps the flag. `list_claimable` returns it as `paused` (`since`, `by`,
+  `reason`, or null), and the dispatcher then starts nothing but `health` and `digest`.
+  `claim` refuses nothing because of it, and a run that is going is not stopped.
+- A `pause` while one stands keeps the first, with its time and reason, and answers
+  `already-paused`. A `resume` with none answers `not-paused`.
+- Only `resume` lifts a pause: it has no end date.
+- Every tier can read the table; `set_pause` and `lift_pause` are for the operator's tier
+  alone and check that the actor is a person.
 
 ### Claims
 
@@ -285,6 +301,7 @@ issue since the operator last acted on it (SQLSTATE `BRD04`; the store raises
     refused on.
   - `factory_board_reconciler_pass_timestamp_seconds`: the reconciler's last `heartbeat`;
     0 until the first one.
+  - `factory_board_paused`: 1 while the operator's pause stands, else 0.
 
 ## Settings
 

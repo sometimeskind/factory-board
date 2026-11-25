@@ -52,6 +52,7 @@ from factory_board.store import (
     Created,
     Item,
     NewItem,
+    Pause,
     Reply,
     Resolution,
     Store,
@@ -84,6 +85,11 @@ closes, and when the last open deploy-check that names the issue closes. The
 dispatcher reads the queue of the stages' items, claims one for each run it starts and
 releases a claim when a run is interrupted. A tool outside the caller's tier is refused.
 
+The operator can pause the factory (pause, with a reason) and lift the pause (resume). While
+it is paused the dispatcher starts no run but the health check and the digest; a run that
+is already going is not stopped, and items are written and closed as before. Pause only
+when the operator asks for it, and show them the answer.
+
 Every verb takes the item's ID, never a position in a list, and answers with a confirmation
 that repeats the item's subject and command: show it to the operator. A closed item stays
 closed; there is no undo.
@@ -104,6 +110,9 @@ ItemId = Annotated[
     str, Field(description="the item's ID: eight characters", pattern=r"^[a-z0-9]{8}$")
 ]
 Text = Annotated[str, Field(min_length=1, max_length=4000)]
+PauseReason = Annotated[
+    str, Field(min_length=1, max_length=500, description="why, in a line: it is shown back")
+]
 Key = Annotated[
     Identifier,
     Field(description="what the item is about when it has no issue, e.g. finding:widget-press-hot"),
@@ -202,6 +211,13 @@ def claim_view(claim: Claim) -> dict[str, Any]:
     if claim.decision_id is not None:
         out["decision"] = claim.decision_id
     return out
+
+
+def pause_view(pause: Pause | None) -> dict[str, Any] | None:
+    """The pause as a tool shows it, or None while the factory is not paused."""
+    if pause is None:
+        return None
+    return {"since": _iso(pause.paused_at), "by": pause.paused_by, "reason": pause.reason}
 
 
 def view(
@@ -837,6 +853,37 @@ def build_server(
 
         return await call("heartbeat", RECONCILER, run)
 
+    # ---- the pause flag ----
+
+    async def pause(reason: PauseReason) -> dict[str, Any]:
+        """Pause the factory: the dispatcher starts no run but the health check and the
+        digest until `resume`. Runs that are going finish, and items are still written and
+        closed. A pause that already stands is kept, with its own time and reason."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            standing, is_new = await store.set_pause(identity.caller, reason)
+            if is_new:
+                log.info("[BOARD] verb=pause actor=%s", identity.caller.identity)
+            return {
+                "status": "paused" if is_new else "already-paused",
+                "paused": pause_view(standing),
+            }
+
+        return await call("pause", OPERATOR, run)
+
+    async def resume() -> dict[str, Any]:
+        """Lift the pause: the dispatcher starts runs again on its next tick. The answer
+        names the pause that stood."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            lifted = await store.lift_pause(identity.caller)
+            if lifted is None:
+                return {"status": "not-paused"}
+            log.info("[BOARD] verb=resume actor=%s", identity.caller.identity)
+            return {"status": "resumed", "was": pause_view(lifted)}
+
+        return await call("resume", OPERATOR, run)
+
     # ---- the dispatcher ----
 
     async def list_claimable() -> dict[str, Any]:
@@ -845,9 +892,12 @@ def build_server(
         then `items` lists every stage's item a run may be started on, with its rank (1 is
         anything urgent, then health, digest, review, deploy-check, assess, work, retro) and
         the oldest first within a rank. `last_claims` are the two claims made last, newest
-        first, for the rule that alternates assess and work."""
+        first, for the rule that alternates assess and work. `paused` is the operator's
+        pause (since, by, reason) or null: while it stands, start only health and digest."""
 
         async def run(identity: Identity) -> dict[str, Any]:
+            # Read before the queue: a pause set while this call runs is seen by the next.
+            paused = await store.pause_state(identity.caller)
             expired = await store.expire_claims(identity.caller, operator_identity)
             for entry in expired:
                 log.info(
@@ -866,6 +916,7 @@ def build_server(
                 ],
                 "items": [view(entry.item) | {"rank": entry.rank} for entry in claimable],
                 "last_claims": [claim_view(claim) for claim in last],
+                "paused": pause_view(paused),
             }
 
         return await call("list_claimable", DISPATCHER, run)
@@ -952,6 +1003,8 @@ def build_server(
         (list_claimable, write),
         (claim, write),
         (release, write),
+        (pause, write),
+        (resume, write),
         (done, final),
         (answer, final),
         (reply, final),

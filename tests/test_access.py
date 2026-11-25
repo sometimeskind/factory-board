@@ -672,11 +672,13 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
         ("items_note_operator_act",),
         ("items_stop_after_expiries",),
         ("items_wake_assess",),
+        ("lift_pause",),
         ("merge_assess_trigger",),
         ("record_heartbeat",),
         ("release_claim",),
         ("replies_note_operator_act",),
         ("run_of_token",),
+        ("set_pause",),
         ("set_pr_head_sha",),
     ]
 
