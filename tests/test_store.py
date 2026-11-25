@@ -196,8 +196,10 @@ async def test_list_open(store: Store) -> None:
     work = (await store.create_item(SESSION, stage("work", 101))).item
     await store.close_item(OPERATOR, closed.id, Resolution.DONE)
 
+    # The close of issue 105's last item woke assess for it.
+    (woken,) = await store.list_open(SESSION, assignee="assess")
     # Urgent first, then the oldest; nothing deferred, nothing closed.
-    assert await store.list_open(OPERATOR) == [urgent, first, due, work]
+    assert await store.list_open(OPERATOR) == [urgent, first, due, work, woken]
     assert await store.list_open(RECONCILER, assignee="operator") == [urgent, first, due]
     assert await store.list_open(SESSION, assignee="work") == [work]
     assert await store.list_open(SESSION, assignee="review") == []
@@ -209,7 +211,7 @@ async def test_list_open(store: Store) -> None:
     ]
     everything = await store.list_open(OPERATOR, include_deferred=True)
     assert closed.id not in [item.id for item in everything]
-    assert len(everything) == 5
+    assert len(everything) == 6
 
 
 # The uniqueness rules: a create is safe to run twice
@@ -497,7 +499,8 @@ async def test_a_success_lets_go_of_what_waits_and_closes_nothing(
     assert (released.is_open, released.after, released.waiting_on) == (True, (first.id,), ())
     still = await store.get_item(OPERATOR, third)
     assert (still.is_open, still.waiting_on) == (True, (second,))
-    assert [item.id for item in await store.list_open(OPERATOR)] == [second, third]
+    listed = await store.list_open(OPERATOR, assignee="operator")
+    assert [item.id for item in listed] == [second, third]
 
 
 async def test_waiting_items_are_listed_last(store: Store) -> None:
@@ -511,7 +514,7 @@ async def test_waiting_items_are_listed_last(store: Store) -> None:
     assert listed == [urgent.id, first.id, plain.id, waiting_urgent, waiting]
 
     await store.close_item(OPERATOR, first.id, Resolution.DONE)
-    listed = [item.id for item in await store.list_open(OPERATOR)]
+    listed = [item.id for item in await store.list_open(OPERATOR, assignee="operator")]
     assert listed == [waiting_urgent, urgent.id, waiting, plain.id]
 
 
@@ -591,7 +594,8 @@ async def test_a_reject_closes_the_whole_chain_after_it(
         # The third names the first, whose close started it, and not the second.
         assert item.result == {"cause": "after", "item": first.id, "resolution": "rejected"}
     # Nothing else is touched: not what waits on an item that was done, not a bystander.
-    assert [item.id for item in await store.list_open(OPERATOR)] == [beside, other.id]
+    listed = await store.list_open(OPERATOR, assignee="operator")
+    assert [item.id for item in listed] == [beside, other.id]
     assert await store.list_cascaded(OPERATOR, done.id) == []
     assert await store.list_cascaded(OPERATOR, second) == []
 
@@ -662,7 +666,8 @@ async def test_an_item_can_follow_a_success_but_not_a_failure(
             InvalidItem, match=f"item {first.id} was closed as {resolution.value}, so nothing"
         ):
             await store.create_item(SESSION, replace(manual(102), after=(first.id,)))
-        assert await count(pool) == 1
+        # The item, and the assess item its close woke.
+        assert await count(pool) == 2
         return
     second = (await store.create_item(SESSION, replace(manual(102), after=(first.id,)))).item
     # The edge is kept and already met.
@@ -677,7 +682,8 @@ async def test_an_item_cannot_follow_one_the_cascade_closed(store: Store, pool: 
         InvalidItem, match=f"item {second.id} was closed as superseded by a cascade, so nothing"
     ):
         await store.create_item(SESSION, replace(manual(103), after=(second.id,)))
-    assert await count(pool) == 2
+    # The two items, and the assess item each one's close woke.
+    assert await count(pool) == 4
 
 
 async def test_what_an_item_is_after_must_be_other_items_and_few(pool: Pool) -> None:
@@ -742,10 +748,12 @@ async def test_the_stats_count_the_waiting_apart(store: Store) -> None:
         ("work", False, False, True): 1,
     }
     await store.close_item(OPERATOR, first.id, Resolution.DONE)
+    # Issue 101's last item closed, which woke assess for it.
     assert counts(await store.stats(RECONCILER)) == {
         ("operator", False, False, False): 2,
         ("operator", True, False, False): 1,
         ("work", False, False, False): 1,
+        ("assess", False, False, False): 1,
     }
 
 

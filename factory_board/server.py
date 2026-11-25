@@ -78,7 +78,9 @@ command was run), answer (a decision), reply (free text), defer (hide until a da
 ("not doing this", with a reason) and bump (make it urgent). A session creates items for the
 operator and reads them. The nightly creates keyed items, reads the replies on its own and
 closes its own. The reconciler writes the items that follow from what GitHub shows, for the
-pipeline's stages and for the operator, and closes them when the fact goes away. The
+pipeline's stages and for the operator, and closes them when the fact goes away. The board
+itself writes an issue's assess item when the operator's last open item that holds the issue
+closes, and when the last open deploy-check that names the issue closes. The
 dispatcher reads the queue of the stages' items, claims one for each run it starts and
 releases a claim when a run is interrupted. A tool outside the caller's tier is refused.
 
@@ -135,9 +137,16 @@ def who(identity: Identity) -> str:
     return caller.identity.partition(":")[2]
 
 
+# What a close by the operator sets off, said with every reject and reply.
+WAKES = (
+    "When this closed the operator's last open item that holds its issue, the board has "
+    "written the issue's assess item, or merged into the open one. A rejected or replied "
+    "pr-approve or pr-merge item does the same for its ticket's issue. No stage runs yet, "
+    "so the assess item waits in the queue."
+)
 NOT_WOKEN = (
-    "Nothing is woken by this yet: until the pipeline's stages run, tell the session that "
-    "wrote the item yourself. The nightly reads the replies on its own items."
+    "The item stays open, so nothing is woken: its holder reads the reply. The nightly "
+    "reads the replies on its own items; no stage reads a reply on a stage's item yet."
 )
 
 
@@ -370,7 +379,7 @@ def build_server(
             "status": status,
             "confirmation": _confirmation(closed),
             "also_closed": [{"id": item.id, "confirmation": _confirmation(item)} for item in also],
-            "note": NOT_WOKEN,
+            "note": WAKES,
         }
 
     async def create(
@@ -714,8 +723,11 @@ def build_server(
         open one. For an assess item it also merges into the open one, unless a run holds it:
         the earlier not_before wins (none is the earliest) and new reasons are appended.
 
-        A deploy-check with closed_as is a record only: it is written closed, and a second
-        write makes a second record, so look for the first with list_pipeline_items."""
+        A deploy-check lists the issues its merged PR references (`issues`): when the last
+        open deploy-check that names an issue closes, the board writes that issue's assess
+        item itself. A deploy-check with closed_as is a record only: it is written closed
+        (which wakes assess for its issues the same way), and a second write makes a second
+        record, so look for the first with list_pipeline_items."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             if not_before is not None and not_before.tzinfo is None:
@@ -808,6 +820,17 @@ def build_server(
             }
 
         return await call("close_for_fact", RECONCILER, run)
+
+    async def heartbeat() -> dict[str, Any]:
+        """Record that a pass over GitHub finished without an error. Call it once, at the
+        end of each pass: the board exports the time, and an alert on its age says the
+        reconciler has stopped."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            at = await store.record_heartbeat(identity.caller)
+            return {"status": "recorded", "at": _iso(at)}
+
+        return await call("heartbeat", RECONCILER, run)
 
     # ---- the dispatcher ----
 
@@ -920,6 +943,7 @@ def build_server(
         (write_stage_item, write),
         (write_operator_item, write),
         (close_for_fact, final),
+        (heartbeat, write),
         (list_claimable, write),
         (claim, write),
         (release, write),

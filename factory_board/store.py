@@ -52,6 +52,9 @@ _WAITING_SQLSTATE = "BRD02"
 # And what claim_item and release_claim raise for an item that can't be claimed or released.
 _NOT_CLAIMABLE_SQLSTATE = "BRD03"
 
+# And what the fix-forward trigger raises for a fourth `work` item on an issue.
+_FIX_FORWARD_SQLSTATE = "BRD04"
+
 # How many items one item may wait on.
 MAX_AFTER = 10
 
@@ -135,6 +138,11 @@ class ItemWaiting(StoreError):
 
 class NotClaimable(StoreError):
     """The item can't be claimed for a run, or its claim can't be released."""
+
+
+class FixForwardLimit(StoreError):
+    """Assess has written three `work` items for the issue since the operator last acted on
+    it. The board refuses a fourth: assess writes a `decision` item instead."""
 
 
 @dataclass(frozen=True)
@@ -321,10 +329,41 @@ class IssueCount:
 
 
 @dataclass(frozen=True)
+class QueueCount:
+    """The items of one stage that a run may be started on now."""
+
+    stage: str
+    urgent: bool
+    count: int
+    # Since when the one longest in the queue could have been claimed, in seconds since the
+    # epoch: the latest of its creation, its `not_before`, the end of its last claim and
+    # the close of the last item it waited on.
+    oldest_since: float
+
+
+@dataclass(frozen=True)
+class ClaimCount:
+    """Claims, ever, by the item's stage and how they ended. `ending` is `running` for a
+    claim that has not ended; `reason` is the release's, and empty otherwise."""
+
+    stage: str
+    ending: str
+    reason: str
+    count: int
+
+
+@dataclass(frozen=True)
 class Stats:
     open: tuple[OpenCount, ...]
     closed: tuple[ClosedCount, ...]
     issues: tuple[IssueCount, ...]
+    queue: tuple[QueueCount, ...]
+    claims: tuple[ClaimCount, ...]
+    # How many issues are at the fix-forward limit: a fourth `work` item would be refused.
+    at_fix_forward_limit: int
+    # When the reconciler last recorded a pass, in seconds since the epoch; None before the
+    # first.
+    reconciler_pass: float | None
 
 
 def new_item_id() -> str:
@@ -403,6 +442,8 @@ def _translate(exc: psycopg.Error) -> StoreError | None:
         return ItemWaiting(exc.diag.message_primary or "the item is waiting")
     if exc.sqlstate == _NOT_CLAIMABLE_SQLSTATE:
         return NotClaimable(exc.diag.message_primary or "the item is not claimable")
+    if exc.sqlstate == _FIX_FORWARD_SQLSTATE:
+        return FixForwardLimit(exc.diag.message_primary or "the fix-forward limit is reached")
     if isinstance(exc, errors.InsufficientPrivilege):
         return NotPermitted(exc.diag.message_primary or "not permitted")
     if isinstance(exc, errors.CheckViolation):
@@ -954,8 +995,18 @@ class Store:
             row = await cur.fetchone()
         return None if row is None else RunToken(*row)
 
+    async def record_heartbeat(self, caller: Caller) -> datetime:
+        """Record that the reconciler finished a pass, at the database's time. The
+        reconciler only."""
+        async with self._as(caller) as conn:
+            cur = await conn.execute("SELECT record_heartbeat()")
+            row = await cur.fetchone()
+        assert row is not None
+        return row[0]
+
     async def stats(self, caller: Caller) -> Stats:
-        """Counts for the metrics: open items, closed ones and per issue, and no item's text."""
+        """Counts for the metrics: open items, closed ones, per issue, the queue and the
+        claims, and no item's text."""
         async with self._as(caller) as conn:
             cur = await conn.execute(
                 """
@@ -995,7 +1046,51 @@ class Store:
                 """
             )
             issues = [IssueCount(*row) for row in await cur.fetchall()]
-        return Stats(tuple(open_items), tuple(closed_items), tuple(issues))
+            # The queue as the dispatcher reads it. An item's age in it is not its age: a
+            # dated item, a released one and one that waited entered the queue later.
+            cur = await conn.execute(
+                """
+                SELECT i.kind, i.urgent, count(*),
+                       min(extract(epoch FROM GREATEST(
+                           i.created_at,
+                           i.not_before,
+                           (SELECT max(c.ended_at) FROM claims AS c WHERE c.item_id = i.id),
+                           (
+                               SELECT max(before.closed_at)
+                               FROM item_after AS a JOIN items AS before ON before.id = a.after_id
+                               WHERE a.item_id = i.id
+                           )
+                       )))::float8
+                FROM claimable AS q JOIN items AS i ON i.id = q.id
+                GROUP BY 1, 2
+                """
+            )
+            queue = [QueueCount(*row) for row in await cur.fetchall()]
+            cur = await conn.execute(
+                """
+                SELECT i.kind, COALESCE(c.ending, 'running'), COALESCE(c.reason, ''), count(*)
+                FROM claims AS c JOIN items AS i ON i.id = c.item_id
+                GROUP BY 1, 2, 3
+                """
+            )
+            claims = [ClaimCount(*row) for row in await cur.fetchall()]
+            cur = await conn.execute("SELECT count(*) FROM fix_forward WHERE at_limit")
+            at_limit = await cur.fetchone()
+            assert at_limit is not None
+            cur = await conn.execute(
+                "SELECT extract(epoch FROM beat_at)::float8 FROM heartbeats "
+                "WHERE process = 'reconciler'"
+            )
+            beat = await cur.fetchone()
+        return Stats(
+            tuple(open_items),
+            tuple(closed_items),
+            tuple(issues),
+            tuple(queue),
+            tuple(claims),
+            at_limit[0],
+            None if beat is None else beat[0],
+        )
 
     async def list_replies(self, caller: Caller, item_id: str) -> list[Reply]:
         """An item's replies, oldest first."""

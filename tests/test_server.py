@@ -72,7 +72,8 @@ TOOLS = {
     "operator": {"list_items", "done", "answer", "reply", "defer", "reject", "bump"} | READS,
     "session": {"create_item", "list_items", "update_pr_head"} | READS,
     "nightly": {"create_keyed_item", "list_own_items", "close_own_item"},
-    "reconciler": {"write_stage_item", "write_operator_item", "close_for_fact"} | READS,
+    "reconciler": {"write_stage_item", "write_operator_item", "close_for_fact", "heartbeat"}
+    | READS,
     "dispatcher": {"list_claimable", "claim", "release"} | READS,
 }
 AHEAD = (datetime.now(UTC) + timedelta(days=2)).isoformat()
@@ -96,6 +97,7 @@ CALLS: dict[str, dict[str, Any]] = {
     "write_stage_item": {"item": ASSESS},
     "write_operator_item": {"item": PR_APPROVE},
     "close_for_fact": {"item_id": "abcdefgh", "cause": "merged"},
+    "heartbeat": {},
     "list_claimable": {},
     "claim": {"item_id": "abcdefgh", "run_id": "20260101-review-01", "cap_minutes": 30},
     "release": {"item_id": "abcdefgh", "reason": "stopped"},
@@ -269,7 +271,7 @@ async def test_reply_closes_a_held_item_and_only_attaches_to_another(board: Boar
     unheld = await board.keyed()
     replied = await board.call(AS_OPERATOR, "reply", item_id=unheld, text="vent is stuck")
     assert "stays open with process:nightly" in replied["status"]
-    assert "Nothing is woken" in replied["note"]
+    assert "nothing is woken" in replied["note"]
     own = await board.call(AS_NIGHTLY, "list_own_items")
     assert [(entry["id"], entry["open"]) for entry in own["items"]] == [(unheld, True)]
     assert own["items"][0]["replies"][0]["text"] == "vent is stuck"
