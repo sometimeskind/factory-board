@@ -212,6 +212,10 @@ class Item:
     expiries: int
     releases: int
     reasons: tuple[str, ...]
+    # On an `assess` item a run holds: the wakes that arrived meanwhile. The board moves
+    # them to the next `assess` item when this one closes, or to `reasons` when it is
+    # released or its claim runs out.
+    pending_reasons: tuple[str, ...]
     input_hash: str | None
     head_sha_moves: tuple[dict[str, Any], ...]
     created_by: str
@@ -398,6 +402,7 @@ def _item(row: DictRow) -> Item:
         expiries=row["expiries"],
         releases=row["releases"],
         reasons=tuple(row["reasons"]),
+        pending_reasons=tuple(row["pending_reasons"]),
         input_hash=row["input_hash"],
         head_sha_moves=tuple(row["head_sha_moves"]),
         created_by=row["created_by"],

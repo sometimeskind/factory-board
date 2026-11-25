@@ -116,6 +116,8 @@ class AssessReason(StrEnum):
     DEPLOY_CHECKS_CLOSED = "deploy-checks-closed"
     DATED = "dated"
     ALERT = "alert"
+    # The reconciler's sweep: an open issue with no open item of any kind.
+    ORPHANED = "orphaned"
 
 
 class ContinuationCause(StrEnum):

@@ -199,8 +199,8 @@ Three rules live in triggers (`migrations/0009_board_triggers.sql`) and act in t
 transaction that makes their fact true. No tier can call or switch them off.
 
 **Waking assess.** The board writes an issue's `assess` item, or merges into the open one:
-the item is due now, and the reason is appended. An `assess` item a run holds is left alone.
-The item is ordinary, held by nobody and created by `process:board`.
+the item is due now, and the reason is appended. The item is ordinary, held by nobody and
+created by `process:board`.
 
 | The fact | Reason | Detail |
 |---|---|---|
@@ -214,6 +214,25 @@ The item is ordinary, held by nobody and created by `process:board`.
 - A reject of a stage's item other than a `deploy-check` wakes nothing, and neither does a
   reply that leaves its item open.
 - Two closes at the same moment take one advisory lock, so one of them sees the other's.
+
+**A wake while a run holds the issue's `assess` item** is kept, not dropped: the staleness
+hash covers the issue's text and not the board's items, so nothing else would notice it.
+
+- The reason is recorded on the held item, in `pending_reasons`, once each. What the run
+  was started on (`reasons`, `not_before`) does not change. No tier can write the column;
+  `get_item` shows it.
+- When the held item closes with reasons pending, however it closed, the board writes the
+  issue's next `assess` item in that transaction, due now and with those reasons, and
+  clears the record.
+- When the item goes back to the queue instead (its claim is released or runs out), the
+  pending reasons move into its `reasons`.
+- An item that waits on the decision after two expired claims is held by no run, so a wake
+  merges into it as into any open item, and goes with it if the operator stops it.
+- The reconciler's own trigger on a held item is still dropped (`merge_assess_trigger`):
+  its facts are on GitHub, where the next pass reads them again.
+- The reasons are `new`, `changed`, `reopened`, `closed-elsewhere`, `dated`, `alert` and
+  `orphaned` (an open issue with no open item of any kind, found by the reconciler's
+  sweep) from the reconciler, and the board's two.
 
 **The operator acted.** `operator_acts` keeps, per issue, when the operator last acted on
 it: any change a `human:` caller makes to an item of the issue (done, answer, reject, a

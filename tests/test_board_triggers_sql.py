@@ -264,13 +264,6 @@ def test_a_wake_merges_into_the_open_assess_item(app_url: str, owner: psycopg.Co
     assert woken(owner) == [["dated", OPERATORS]]
 
 
-def test_an_assess_item_a_run_holds_is_left_alone(app_url: str, owner: psycopg.Connection) -> None:
-    insert_stage_row(owner, SECOND, assignee="assess", reasons=["changed"], claimed_by=RUN.identity)
-    insert_row(owner, id=FIRST)
-    close(app_url, FIRST)
-    assert assessments(owner) == [(["changed"], None, RUN.identity, "session:0a1b2c3d", False)]
-
-
 def test_two_closes_at_once_wake_the_issue_once(app_url: str, owner: psycopg.Connection) -> None:
     """Without the lock each close would see the other's item still open, and neither
     would wake anything."""
@@ -411,6 +404,198 @@ def test_a_stuck_assess_item_s_decision_never_writes_another(
     assert is_open(owner, FIRST) is again
     # The one item it was: no reason added, and no second item once it is stopped.
     assert woken(owner) == ([[]] if again else [])
+
+
+# ---- A wake that meets an assess item a run holds ----
+
+RUN_ID = RUN.identity.partition(":")[2]
+HELD = "hhhhhhhh"
+
+
+def hold(owner: psycopg.Connection, app_url: str, **overrides: Any) -> None:
+    """Issue 101's assess item, written for one reason and claimed for the run of RUN."""
+    insert_stage_row(owner, HELD, assignee="assess", reasons=["changed"], **overrides)
+    with as_tier(app_url, DISPATCHER) as conn:
+        conn.execute(
+            "SELECT claim_item(%s, %s, %s, %s, %s)", (HELD, RUN_ID, 30, sha(RUN_ID), "hash-1")
+        )
+
+
+def wake(owner: psycopg.Connection, app_url: str, item_id: str = FIRST) -> None:
+    """The operator's last item on issue 101 closes."""
+    insert_row(owner, id=item_id)
+    close(app_url, item_id)
+
+
+def reasons_of(owner: psycopg.Connection, item_id: str = HELD) -> tuple[Any, ...]:
+    """(reasons, pending_reasons, holder, open) of an item."""
+    row = owner.execute(
+        "SELECT reasons, pending_reasons, claimed_by, closed_at IS NULL FROM items WHERE id = %s",
+        (item_id,),
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+def test_a_wake_during_a_claim_waits_on_the_held_item(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    # What the run was started on is not changed, and no second item is written.
+    assert reasons_of(owner) == (["changed"], [OPERATORS], RUN.identity, True)
+    assert woken(owner) == [["changed"]]
+
+
+def test_the_close_of_the_held_item_writes_the_next_one_with_what_waited(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    close(app_url, HELD, by=RUN, result={"outcome": "wait"})
+    # The record is cleared, and the next item is the board's: due now and held by nobody.
+    assert reasons_of(owner) == (["changed"], [], RUN.identity, False)
+    assert assessments(owner) == [([OPERATORS], None, None, "process:board", False)]
+
+
+def test_two_reasons_that_waited_both_reach_the_next_item(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    insert_check(owner, CHECK, 101)
+    close(app_url, CHECK, "superseded", by=RECONCILER)
+    assert reasons_of(owner)[1] == [OPERATORS, DEPLOYS]
+    close(app_url, HELD, by=RUN)
+    assert woken(owner) == [[OPERATORS, DEPLOYS]]
+
+
+def test_the_same_wake_twice_waits_once(app_url: str, owner: psycopg.Connection) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    wake(owner, app_url, SECOND)
+    assert reasons_of(owner)[1] == [OPERATORS]
+    # A reason the item was written for is still kept when it arrives again during the run.
+    owner.execute("UPDATE items SET reasons = %s WHERE id = %s", ([OPERATORS], HELD))
+    wake(owner, app_url, THIRD)
+    assert reasons_of(owner)[:2] == ([OPERATORS], [OPERATORS])
+    close(app_url, HELD, by=RUN)
+    assert woken(owner) == [[OPERATORS]]
+
+
+def test_a_close_with_nothing_pending_writes_nothing(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    close(app_url, HELD, by=RUN)
+    assert woken(owner) == []
+    assert owner.execute("SELECT count(*) FROM items").fetchone() == (1,)
+
+
+@pytest.mark.parametrize("route", ["reject", "cascade"])
+def test_the_held_item_s_close_carries_what_waited_however_it_closed(
+    app_url: str, owner: psycopg.Connection, route: str
+) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    if route == "reject":
+        close(app_url, HELD, "rejected", result={"reason": "stop this"})
+    else:
+        # The held item waits on an item of another issue, which the operator refuses.
+        insert_row(owner, id=SECOND, subject_ref="102")
+        owner.execute("INSERT INTO item_after (item_id, after_id) VALUES (%s, %s)", (HELD, SECOND))
+        close(app_url, SECOND, "replied")
+    assert reasons_of(owner)[1:] == ([], RUN.identity, False)
+    assert woken(owner) == [[OPERATORS]]
+
+
+def test_a_release_hands_what_waited_to_the_item(app_url: str, owner: psycopg.Connection) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    with as_tier(app_url, RUN) as conn:
+        conn.execute("SELECT release_claim(%s, %s, NULL)", (HELD, "usage-limit"))
+    assert reasons_of(owner) == (["changed", OPERATORS], [], None, True)
+    with as_tier(app_url, DISPATCHER) as conn:
+        assert conn.execute("SELECT id FROM claimable").fetchall() == [(HELD,)]
+    # The next run holds it with nothing pending, and its close writes nothing more.
+    with as_tier(app_url, DISPATCHER) as conn:
+        run = "20260101-assess-02"
+        conn.execute("SELECT claim_item(%s, %s, %s, %s, %s)", (HELD, run, 30, sha(run), "hash-1"))
+    owner.execute("UPDATE items SET closed_at = now(), resolution = 'done' WHERE id = %s", (HELD,))
+    assert woken(owner) == []
+
+
+def test_a_claim_that_runs_out_hands_what_waited_to_the_item(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    wake(owner, app_url)
+    owner.execute("UPDATE items SET claim_expires = now() - interval '1 minute'")
+    owner.execute("UPDATE claims SET expires_at = now() - interval '1 minute'")
+    with as_tier(app_url, DISPATCHER) as conn:
+        conn.execute("SELECT * FROM expire_claims(%s)", (OPERATOR.identity,))
+    assert reasons_of(owner) == (["changed", OPERATORS], [], None, True)
+
+
+def test_a_wake_after_the_item_is_back_in_the_queue_merges_as_before(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    with as_tier(app_url, DISPATCHER) as conn:
+        conn.execute("SELECT release_claim(%s, %s, NULL)", (HELD, "stopped"))
+    wake(owner, app_url)
+    assert reasons_of(owner) == (["changed", OPERATORS], [], None, True)
+
+
+def test_a_wake_on_an_item_that_waits_on_its_decision_merges_and_goes_with_it(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    """After two expired claims no run holds the item, so nothing is pending on it."""
+    decision = stuck(owner, app_url, "assess")
+    insert_check(owner, CHECK, 101)
+    close(app_url, CHECK, "superseded", by=RECONCILER)
+    assert reasons_of(owner, FIRST) == ([DEPLOYS], [], None, True)
+    close(app_url, decision, "answered", result={"option": 2, "answer": "Stop"})
+    assert reasons_of(owner, FIRST)[3] is False
+    assert woken(owner) == []
+
+
+def test_the_reconciler_s_trigger_on_a_held_item_is_still_dropped(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    """Its facts are on GitHub: the next pass reads them again, and the hash decides."""
+    hold(owner, app_url)
+    with as_tier(app_url, RECONCILER) as conn:
+        merged = conn.execute(
+            "SELECT merge_assess_trigger(%s, NULL, ARRAY['reopened'])", (HELD,)
+        ).fetchone()
+    assert merged == (False,)
+    assert reasons_of(owner) == (["changed"], [], RUN.identity, True)
+
+
+@pytest.mark.parametrize("caller", [*EVERY_TIER, RUN, DISPATCHER], ids=lambda c: c.identity)
+def test_no_tier_writes_what_is_pending(
+    app_url: str, owner: psycopg.Connection, caller: Caller
+) -> None:
+    hold(owner, app_url)
+    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+        conn.execute("UPDATE items SET pending_reasons = ARRAY['new'] WHERE id = %s", (HELD,))
+    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+        insert_stage_row(
+            conn,
+            SECOND,
+            assignee="assess",
+            subject_ref="102",
+            created_by=caller.identity,
+            pending_reasons=["new"],
+        )
+    with as_tier(app_url, caller) as conn:
+        assert conn.execute("SELECT pending_reasons FROM items").fetchall() == [([],)]
+
+
+def test_only_an_assess_item_has_reasons_pending(owner: psycopg.Connection) -> None:
+    with pytest.raises(errors.CheckViolation, match="items_pending_reasons_on_assess"):
+        insert_stage_row(owner, FIRST, pending_reasons=["new"])
 
 
 # ---- The last open deploy-check on an issue closed ----
@@ -644,7 +829,6 @@ WORK = (
     "created_by, created_run) VALUES (%s, 'work', 'work', %s, 'issue', %s, %s, %s) "
     "ON CONFLICT DO NOTHING"
 )
-RUN_ID = RUN.identity.partition(":")[2]
 
 
 def assess_writes(app_url: str, item_id: str, number: int = 101) -> int:
@@ -808,7 +992,9 @@ def test_the_board_s_functions_are_the_owner_s_and_one_is_called_by_a_tier(
                 "board_wake_assess",
                 "item_issues",
                 "items_note_operator_act",
+                "items_carry_pending_wake",
                 "items_refuse_past_fix_forward_limit",
+                "items_take_pending_reasons",
                 "items_wake_assess",
                 "record_heartbeat",
                 "replies_note_operator_act",
@@ -820,9 +1006,12 @@ def test_the_board_s_functions_are_the_owner_s_and_one_is_called_by_a_tier(
     assert rows == [
         ("board_wake_assess", False, path, "board_owner", f"{{{mine}}}"),
         ("item_issues", False, path, "board_owner", f"{{{mine}}}"),
+        ("items_carry_pending_wake", True, path, "board_owner", f"{{{mine}}}"),
         ("items_note_operator_act", True, path, "board_owner", f"{{{mine}}}"),
         # A trigger's function that runs as the caller, like the one for a waiting item.
         ("items_refuse_past_fix_forward_limit", False, path, "board_owner", None),
+        # It only moves the row's own reasons, for whoever unclaims the item.
+        ("items_take_pending_reasons", False, path, "board_owner", None),
         ("items_wake_assess", True, path, "board_owner", f"{{{mine}}}"),
         ("record_heartbeat", True, path, "board_owner", f"{{{mine},board_process=X/board_owner}}"),
         ("replies_note_operator_act", True, path, "board_owner", f"{{{mine}}}"),
@@ -834,8 +1023,9 @@ def test_no_tier_wakes_assess_itself(
     app_url: str, owner: psycopg.Connection, caller: Caller
 ) -> None:
     calls: list[LiteralString] = [
-        "SELECT board_wake_assess('example/repo', '101', 'operator-items-closed')",
+        "SELECT board_wake_assess('example/repo', '101', ARRAY['operator-items-closed'])",
         "SELECT items_wake_assess()",
+        "SELECT items_carry_pending_wake()",
         "SELECT items_note_operator_act()",
         "SELECT replies_note_operator_act()",
         "SELECT * FROM item_issues((SELECT i FROM items AS i LIMIT 1))",

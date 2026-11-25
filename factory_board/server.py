@@ -228,6 +228,9 @@ def view(
         out["fields"] = item.fields
         if item.reasons:
             out["reasons"] = list(item.reasons)
+        if item.pending_reasons:
+            # Wakes that arrived while a run held the item; the board carries them on.
+            out["pending_reasons"] = list(item.pending_reasons)
         if item.input_hash is not None:
             out["input_hash"] = item.input_hash
         if item.claim_expires is not None:
@@ -710,7 +713,7 @@ def build_server(
         ] = None,
         reasons: Annotated[
             list[AssessReason],
-            Field(max_length=8, description="for an assess item: why the issue is to be assessed"),
+            Field(max_length=9, description="for an assess item: why the issue is to be assessed"),
         ] = [],  # noqa: B006
         urgent: bool = False,
         closed_as: Annotated[

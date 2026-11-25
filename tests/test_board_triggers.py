@@ -34,7 +34,7 @@ from pydantic import ValidationError
 
 from factory_board import metrics
 from factory_board.auth import Identity
-from factory_board.kinds import DeployCheck, parse_stage_item
+from factory_board.kinds import AssessReason, DeployCheck, parse_stage_item
 from factory_board.server import build_server
 from factory_board.store import (
     Caller,
@@ -44,6 +44,7 @@ from factory_board.store import (
     QueueCount,
     Resolution,
     Store,
+    Subject,
     Tier,
 )
 
@@ -414,3 +415,122 @@ async def test_the_metrics_show_the_queue_the_claims_and_the_limit(
     metrics.show(await store.stats(METRICS))
     assert sample("factory_board_claimable_items", stage="assess", urgent="false") == 0
     assert sample("factory_board_claims", stage="assess", ending="running", reason="") == 1
+
+
+# ---- a wake while a run holds the issue's assess item ----
+
+
+async def held_assess(board: Board, run_id: str = "20260101-assess-01") -> str:
+    """Issue 101's assess item, claimed for a run; its ID."""
+    written = await board.call(
+        AS_RECONCILER, "write_stage_item", item={"kind": "assess", "issue": TICKET}
+    )
+    item_id = written["item"]["id"]
+    await board.call(
+        AS_DISPATCHER,
+        "claim",
+        item_id=item_id,
+        run_id=run_id,
+        cap_minutes=30,
+        input_hash="hash-1",
+    )
+    return item_id
+
+
+async def test_a_wake_during_a_run_is_shown_and_carried_to_the_next_item(
+    board: Board, store: Store
+) -> None:
+    held = await held_assess(board)
+    await board.call(AS_OPERATOR, "done", item_id=await board.create(MANUAL))
+    await board.call(
+        AS_RECONCILER, "write_stage_item", item=DEPLOY_CHECK, closed_as="nothing-to-deploy"
+    )
+    shown = await board.call(AS_OPERATOR, "get_item", item_id=held)
+    assert shown["pending_reasons"] == ["operator-items-closed", "deploy-checks-closed"]
+    assert "reasons" not in shown
+    waiting = await store.get_item(OPERATOR, held)
+    assert waiting.pending_reasons == ("operator-items-closed", "deploy-checks-closed")
+
+    # The run closes its item: the next one is written in that transaction.
+    run = Caller(Tier.AGENT, "run:20260101-assess-01")
+    closed = await store.close_item(run, held, Resolution.DONE, {"outcome": "wait"})
+    assert closed.is_open is False
+    assert (await store.get_item(OPERATOR, held)).pending_reasons == ()
+    (next_item,) = [
+        item
+        for item in await store.list_open(OPERATOR, assignee="assess")
+        if item.subject == Subject("issue", "101", REPO)
+    ]
+    assert next_item.reasons == ("operator-items-closed", "deploy-checks-closed")
+    assert (next_item.claimed_by, next_item.created_by) == (None, "process:board")
+    assert (next_item.not_before, next_item.pending_reasons) == (None, ())
+
+
+async def test_a_release_gives_the_item_what_arrived_during_the_run(board: Board) -> None:
+    held = await held_assess(board)
+    await board.call(AS_OPERATOR, "done", item_id=await board.create(MANUAL))
+    released = await board.call(AS_DISPATCHER, "release", item_id=held, reason="infra-window")
+    assert released["item"]["reasons"] == ["operator-items-closed"]
+    assert "pending_reasons" not in released["item"]
+    queue = await board.call(AS_DISPATCHER, "list_claimable")
+    assert [entry["id"] for entry in queue["items"]] == [held]
+
+
+async def test_a_run_s_close_with_nothing_pending_writes_nothing(
+    board: Board, store: Store
+) -> None:
+    held = await held_assess(board)
+    run = Caller(Tier.AGENT, "run:20260101-assess-01")
+    await store.close_item(run, held, Resolution.DONE)
+    assert await store.list_open(OPERATOR) == []
+
+
+# ---- the reasons ----
+
+
+@pytest.mark.parametrize("reason", [reason.value for reason in AssessReason])
+async def test_the_reconciler_writes_every_reason(board: Board, reason: str) -> None:
+    written = await board.call(
+        AS_RECONCILER,
+        "write_stage_item",
+        item={"kind": "assess", "issue": TICKET},
+        reasons=[reason],
+    )
+    assert written["item"]["reasons"] == [reason]
+
+
+async def test_the_reasons_are_these_nine(board: Board) -> None:
+    assert [reason.value for reason in AssessReason] == [
+        "new",
+        "changed",
+        "reopened",
+        "closed-elsewhere",
+        "operator-items-closed",
+        "deploy-checks-closed",
+        "dated",
+        "alert",
+        "orphaned",
+    ]
+    # The sweep's reason merges into an open item like any other, and all nine fit one write.
+    await board.call(AS_OPERATOR, "done", item_id=await board.create(MANUAL))
+    merged = await board.call(
+        AS_RECONCILER,
+        "write_stage_item",
+        item={"kind": "assess", "issue": TICKET},
+        reasons=["orphaned"],
+    )
+    assert merged["item"]["reasons"] == ["operator-items-closed", "orphaned"]
+    everything = await board.call(
+        AS_RECONCILER,
+        "write_stage_item",
+        item={"kind": "assess", "issue": {"repo": REPO, "number": 102}},
+        reasons=[reason.value for reason in AssessReason],
+    )
+    assert len(everything["item"]["reasons"]) == 9
+    with pytest.raises(ToolError):
+        await board.call(
+            AS_RECONCILER,
+            "write_stage_item",
+            item={"kind": "assess", "issue": {"repo": REPO, "number": 103}},
+            reasons=["abandoned"],
+        )

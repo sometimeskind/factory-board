@@ -192,27 +192,41 @@ CREATE TRIGGER items_work_within_fix_forward_limit
 
 -- ---- Waking assess ----
 
--- Write the issue's `assess` item, or merge into the one that is open: it is due now (no
--- date is the earliest) and gets the reason if it does not have it. An item a run holds is
--- left alone, as in merge_assess_trigger. The item is ordinary, held by nobody, and written
--- by `process:board`, which is no token's identity.
+-- A wake that meets an `assess` item someone holds can't change what the run was started
+-- on, and must not be lost: the staleness hash covers the issue's text, not the board's
+-- items. Its reasons wait here, on the held item, each once. No tier has a grant on the
+-- column: only the functions below write it.
+ALTER TABLE items
+    ADD COLUMN pending_reasons text[] NOT NULL DEFAULT '{}'
+    CONSTRAINT items_pending_reasons_on_assess
+        CHECK (cardinality(pending_reasons) = 0 OR kind = 'assess');
+
+-- Wake assess for an issue, with one reason or several:
+--   - the issue's open `assess` item that nobody holds takes them: it is due now (no date
+--     is the earliest) and gets each reason it does not have;
+--   - one that is held keeps them as pending, each once, for the triggers below;
+--   - with none open, a new item is written: ordinary, held by nobody, due now, and written
+--     by `process:board`, which is no token's identity.
 --
--- Only the trigger below calls it; no tier may.
-CREATE FUNCTION board_wake_assess(repo text, issue text, reason text) RETURNS void
+-- Only the triggers below call it; no tier may.
+CREATE FUNCTION board_wake_assess(repo text, issue text, reasons text[]) RETURNS void
     LANGUAGE plpgsql
     SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
     new_id text;
 BEGIN
-    -- Twice more if the reconciler writes or closes the issue's item at this very moment.
+    -- Again when the item is closed, released or written by someone else at this very
+    -- moment: each statement waits for the other transaction and then finds no row.
     FOR attempt IN 1..3 LOOP
         UPDATE public.items AS i
             SET not_before = NULL,
-                reasons = CASE
-                    WHEN board_wake_assess.reason = ANY (i.reasons) THEN i.reasons
-                    ELSE i.reasons || board_wake_assess.reason
-                END
+                reasons = i.reasons || ARRAY(
+                    SELECT t.name
+                    FROM unnest(board_wake_assess.reasons) WITH ORDINALITY AS t (name, position)
+                    WHERE t.name <> ALL (i.reasons)
+                    ORDER BY t.position
+                )
             WHERE i.closed_at IS NULL
               AND i.assignee = 'assess'
               AND i.subject_type = 'issue'
@@ -222,14 +236,20 @@ BEGIN
         IF FOUND THEN
             RETURN;
         END IF;
-        IF EXISTS (
-            SELECT FROM public.items AS i
+        UPDATE public.items AS i
+            SET pending_reasons = i.pending_reasons || ARRAY(
+                    SELECT t.name
+                    FROM unnest(board_wake_assess.reasons) WITH ORDINALITY AS t (name, position)
+                    WHERE t.name <> ALL (i.pending_reasons)
+                    ORDER BY t.position
+                )
             WHERE i.closed_at IS NULL
               AND i.assignee = 'assess'
               AND i.subject_type = 'issue'
               AND i.subject_repo = board_wake_assess.repo
               AND i.subject_ref = board_wake_assess.issue
-        ) THEN
+              AND i.claimed_by IS NOT NULL;
+        IF FOUND THEN
             RETURN;
         END IF;
         LOOP
@@ -253,7 +273,7 @@ BEGIN
                 ),
                 'note', NULL
             ),
-            ARRAY[board_wake_assess.reason],
+            board_wake_assess.reasons,
             'process:board'
         )
         ON CONFLICT DO NOTHING;
@@ -264,7 +284,70 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION board_wake_assess(text, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION board_wake_assess(text, text, text[]) FROM PUBLIC;
+
+-- A held `assess` item that goes back to the queue (its claim was released or ran out)
+-- takes its pending reasons itself: the next run starts on them.
+CREATE FUNCTION items_take_pending_reasons() RETURNS trigger
+    LANGUAGE plpgsql
+    SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    NEW.reasons := NEW.reasons || ARRAY(
+        SELECT t.name
+        FROM unnest(NEW.pending_reasons) WITH ORDINALITY AS t (name, position)
+        WHERE t.name <> ALL (NEW.reasons)
+        ORDER BY t.position
+    );
+    NEW.pending_reasons := '{}';
+    RETURN NEW;
+END
+$$;
+
+CREATE TRIGGER items_unheld_takes_pending_reasons
+    BEFORE UPDATE ON items
+    FOR EACH ROW
+    WHEN (
+        OLD.claimed_by IS NOT NULL
+        AND NEW.claimed_by IS NULL
+        AND NEW.closed_at IS NULL
+        AND cardinality(NEW.pending_reasons) > 0
+    )
+    EXECUTE FUNCTION items_take_pending_reasons();
+
+-- A held `assess` item that closes with reasons pending: the board writes the issue's next
+-- `assess` item at once, with those reasons, in the transaction of the close. However it
+-- closed and whoever closed it: its run, the operator's reject, a cascade.
+--
+-- It takes no advisory lock. A wake waits for this item's row while it holds the wakes'
+-- lock, so a lock taken here, after the row, could never be given. Nothing here needs one:
+-- a wake that waited finds the item closed and goes on to the new one.
+CREATE FUNCTION items_carry_pending_wake() RETURNS trigger
+    LANGUAGE plpgsql
+    SECURITY DEFINER
+    SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    PERFORM public.board_wake_assess(NEW.subject_repo, NEW.subject_ref, NEW.pending_reasons);
+    -- The owner may change a closed item: the reasons have moved on.
+    UPDATE public.items AS i SET pending_reasons = '{}' WHERE i.id = NEW.id;
+    RETURN NULL;
+END
+$$;
+
+REVOKE ALL ON FUNCTION items_carry_pending_wake() FROM PUBLIC;
+
+CREATE TRIGGER items_close_carries_pending_wake
+    AFTER UPDATE ON items
+    FOR EACH ROW
+    WHEN (
+        OLD.closed_at IS NULL
+        AND NEW.closed_at IS NOT NULL
+        AND NEW.kind = 'assess'
+        AND NEW.subject_type = 'issue'
+        AND cardinality(NEW.pending_reasons) > 0
+    )
+    EXECUTE FUNCTION items_carry_pending_wake();
 
 -- The facts that live in the board, acted on in the transaction that makes them true.
 --
@@ -279,7 +362,9 @@ REVOKE ALL ON FUNCTION board_wake_assess(text, text, text) FROM PUBLIC;
 --     itself; superseded, the reconciler writes the next one.
 --   - The decision written after two expired claims wakes nothing when it sends its item
 --     back to the queue ("try again"), and nothing when its item is the issue's own
---     `assess` item: the operator stopped that assessment.
+--     `assess` item: the operator stopped that assessment. (That item is held by no run
+--     while it waits on the decision, so a wake in that time merges into it and goes with
+--     it when the operator stops it.)
 --
 -- The last open `deploy-check` on an issue closed (`deploy-checks-closed`): for each issue
 -- the item names, when no other open `deploy-check` names it. However it closed, and also
@@ -330,7 +415,7 @@ BEGIN
                   AND i.holds
             ) THEN
                 PERFORM public.board_wake_assess(
-                    target.repo, target.issue, 'operator-items-closed'
+                    target.repo, target.issue, ARRAY['operator-items-closed']
                 );
             END IF;
         END LOOP;
@@ -346,7 +431,7 @@ BEGIN
                   AND other.issue = target.issue
             ) THEN
                 PERFORM public.board_wake_assess(
-                    target.repo, target.issue, 'deploy-checks-closed'
+                    target.repo, target.issue, ARRAY['deploy-checks-closed']
                 );
             END IF;
         END LOOP;
