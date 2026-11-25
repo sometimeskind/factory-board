@@ -141,6 +141,20 @@ SUBJECT_TYPES: tuple[str, ...] = tuple(subject_type.value for subject_type in Su
 TERRAFORM_MODULES: tuple[str, ...] = tuple(module.value for module in TerraformModule)
 KUBECTL_VERBS: tuple[str, ...] = tuple(verb.value for verb in KubectlVerb)
 
+
+class ReleaseReason(StrEnum):
+    """Why a run's claim was given back: a known interruption, which is not an expiry."""
+
+    # The run's unit did not start.
+    START_FAILED = "start-failed"
+    INFRA_WINDOW = "infra-window"
+    USAGE_LIMIT = "usage-limit"
+    # A clean stop: systemctl stop, or pilot shutting down.
+    STOPPED = "stopped"
+    # A deploy-check looked, and the change is not live yet.
+    NOT_LIVE = "not-live"
+
+
 # --- Field types -----------------------------------------------------------------------
 
 # Unicode categories that can break a line or hide text: controls (newline and tab among
@@ -188,6 +202,11 @@ Number = Annotated[int, Field(strict=True, gt=0, le=2**31 - 1)]
 HeadSha = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$")]
 # An alert name or a finding ID.
 Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")]
+
+# A run's ID, as an identity's name: `run:<id>` holds the item it claimed.
+RunId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")]
+# The staleness hash of an issue, as the reconciler computes it.
+ClaimHash = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
 
 # Kubernetes names, from k8s.io/apimachinery/pkg/util/validation (dns1123LabelFmt, 63
 # characters; dns1123SubdomainFmt, 253 characters).

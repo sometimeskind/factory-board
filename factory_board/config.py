@@ -86,11 +86,12 @@ class ServerSettings:
     # The operator's Pocket ID username: a new item for the operator is held by
     # `human:<operator>`, whoever wrote it.
     operator: str
-    # Interactive sessions on pilot share one token; the nightly and the reconciler have
-    # one each.
+    # Interactive sessions on pilot share one token; the nightly, the reconciler and the
+    # dispatcher have one each.
     session_token_sha256: str | None = None
     nightly_token_sha256: str | None = None
     reconciler_token_sha256: str | None = None
+    dispatcher_token_sha256: str | None = None
     # "" binds every address of both families (uvicorn makes "::" IPv6-only).
     host: str = ""
     port: int = 8000
@@ -103,6 +104,7 @@ class ServerSettings:
             ("FACTORY_BOARD_SESSION_TOKEN_SHA256", self.session_token_sha256),
             ("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256", self.nightly_token_sha256),
             ("FACTORY_BOARD_RECONCILER_TOKEN_SHA256", self.reconciler_token_sha256),
+            ("FACTORY_BOARD_DISPATCHER_TOKEN_SHA256", self.dispatcher_token_sha256),
         )
         seen: dict[str, str] = {}
         for name, value in hashes:
@@ -156,4 +158,5 @@ class ServerSettings:
             session_token_sha256=optional("FACTORY_BOARD_SESSION_TOKEN_SHA256"),
             nightly_token_sha256=optional("FACTORY_BOARD_NIGHTLY_TOKEN_SHA256"),
             reconciler_token_sha256=optional("FACTORY_BOARD_RECONCILER_TOKEN_SHA256"),
+            dispatcher_token_sha256=optional("FACTORY_BOARD_DISPATCHER_TOKEN_SHA256"),
         )

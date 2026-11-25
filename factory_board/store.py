@@ -21,6 +21,7 @@ whatever the server sets.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import secrets
 from collections.abc import AsyncGenerator, Callable
@@ -47,6 +48,9 @@ PR_KINDS = ("pr-approve", "pr-merge")
 _CLOSED_SQLSTATE = "BRD01"
 # And the items_waiting_is_not_done trigger's.
 _WAITING_SQLSTATE = "BRD02"
+
+# And what claim_item and release_claim raise for an item that can't be claimed or released.
+_NOT_CLAIMABLE_SQLSTATE = "BRD03"
 
 # How many items one item may wait on.
 MAX_AFTER = 10
@@ -127,6 +131,10 @@ class InvalidItem(StoreError):
 
 class ItemWaiting(StoreError):
     """The item waits on an open item, and so can't be closed as done or answered."""
+
+
+class NotClaimable(StoreError):
+    """The item can't be claimed for a run, or its claim can't be released."""
 
 
 @dataclass(frozen=True)
@@ -221,6 +229,62 @@ class Created:
 
 
 @dataclass(frozen=True)
+class Claimable:
+    """An item a run may be started on, and its place in the order (1 is first)."""
+
+    item: Item
+    rank: int
+
+
+@dataclass(frozen=True)
+class Claim:
+    """One claim of an item for a run. `ending` is None while it runs."""
+
+    run: str
+    item_id: str
+    # The item's kind, which is the run's stage, and whether the item is urgent.
+    stage: str
+    urgent: bool
+    claimed_at: datetime
+    expires_at: datetime
+    ended_at: datetime | None
+    ending: str | None
+    reason: str | None
+    decision_id: str | None
+
+
+@dataclass(frozen=True)
+class Claimed:
+    """The outcome of a claim. `token` is the run's token, returned here and stored nowhere;
+    it is None when the item was a stale `work` item, which the claim closed instead."""
+
+    item: Item
+    token: str | None
+
+    @property
+    def stale(self) -> bool:
+        return self.token is None
+
+
+@dataclass(frozen=True)
+class Expired:
+    """A claim that ran out, and the decision item written for it, if one was."""
+
+    item_id: str
+    run: str
+    decision_id: str | None
+
+
+@dataclass(frozen=True)
+class RunToken:
+    """Whose token this is: the run, its item and its stage."""
+
+    run: str
+    item_id: str
+    stage: str
+
+
+@dataclass(frozen=True)
 class Reply:
     id: UUID
     item_id: str
@@ -307,6 +371,26 @@ def _item(row: DictRow) -> Item:
     )
 
 
+_CLAIM = sql.SQL(
+    """
+    c.run, c.item_id, i.kind AS stage, i.urgent, c.claimed_at, c.expires_at, c.ended_at,
+    c.ending, c.reason, c.decision_id
+    """
+)
+
+
+def _claim(row: DictRow) -> Claim:
+    return Claim(**row)
+
+
+def new_run_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def token_sha256(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 def _reply(row: DictRow) -> Reply:
     return Reply(row["id"], row["item_id"], row["author"], row["created_at"], row["body"])
 
@@ -317,6 +401,8 @@ def _translate(exc: psycopg.Error) -> StoreError | None:
         return ItemClosed(exc.diag.message_primary or "the item is closed")
     if exc.sqlstate == _WAITING_SQLSTATE:
         return ItemWaiting(exc.diag.message_primary or "the item is waiting")
+    if exc.sqlstate == _NOT_CLAIMABLE_SQLSTATE:
+        return NotClaimable(exc.diag.message_primary or "the item is not claimable")
     if isinstance(exc, errors.InsufficientPrivilege):
         return NotPermitted(exc.diag.message_primary or "not permitted")
     if isinstance(exc, errors.CheckViolation):
@@ -665,7 +751,8 @@ class Store:
             )
 
     async def list_cascaded(self, caller: Caller, item_id: str) -> list[Item]:
-        """The items that closed because this one was rejected or replied to, oldest first.
+        """The items that closed because this one was rejected or replied to, or because a
+        two-expiry decision was answered with anything but "try again"; oldest first.
 
         A closer writes its own result, so the result alone proves nothing: the cascade's
         items also closed in the transaction that closed this one, at the same moment.
@@ -766,6 +853,106 @@ class Store:
         except errors.ForeignKeyViolation as exc:
             raise ItemNotFound(f"no item {item_id}") from exc
         return _reply(row), item
+
+    # ---- claims ----
+
+    async def list_claimable(self, caller: Caller) -> list[Claimable]:
+        """The items a run may be started on, in the order to take them: the rank, then the
+        oldest. The rule is the `claimable` view (migrations/0008_claims.sql)."""
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    """
+                SELECT {}, claimable.rank AS claim_rank
+                FROM items JOIN claimable ON claimable.id = items.id
+                ORDER BY claimable.rank, items.created_at, items.id
+                """
+                ).format(_ITEM)
+            )
+            return [Claimable(_item(row), row["claim_rank"]) for row in await cur.fetchall()]
+
+    async def last_claims(self, caller: Caller, limit: int = 2) -> list[Claim]:
+        """The claims made last, newest first, whatever became of them."""
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    "SELECT {} FROM claims AS c JOIN items AS i ON i.id = c.item_id "
+                    "ORDER BY c.claimed_at DESC, c.run DESC LIMIT %s"
+                ).format(_CLAIM),
+                (limit,),
+            )
+            return [_claim(row) for row in await cur.fetchall()]
+
+    async def list_claims(self, caller: Caller, item_id: str) -> list[Claim]:
+        """An item's claims, oldest first."""
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    "SELECT {} FROM claims AS c JOIN items AS i ON i.id = c.item_id "
+                    "WHERE c.item_id = %s ORDER BY c.claimed_at, c.run"
+                ).format(_CLAIM),
+                (item_id,),
+            )
+            return [_claim(row) for row in await cur.fetchall()]
+
+    async def claim_item(
+        self,
+        caller: Caller,
+        item_id: str,
+        run: str,
+        cap_minutes: int,
+        input_hash: str | None = None,
+    ) -> Claimed:
+        """Claim an item for one run, and mint the run's token. The dispatcher only.
+
+        The claim runs out ten minutes after `cap_minutes`. `input_hash` is the issue's
+        current staleness hash: an `assess` item is stamped with it, and a `work` item
+        assessed under another one is closed as superseded instead (`Claimed.stale`).
+        Raises NotClaimable for an item that is held, deferred, waiting or no stage's.
+        """
+        token = new_run_token()
+        async with self._as(caller) as conn:
+            cur = await conn.execute(
+                "SELECT claim_item(%s, %s, %s, %s, %s)",
+                (item_id, run, cap_minutes, token_sha256(token), input_hash),
+            )
+            outcome = await cur.fetchone()
+            item = await self._fetch(conn, item_id)
+        assert item is not None
+        return Claimed(item, token if outcome == ("claimed",) else None)
+
+    async def release_claim(
+        self, caller: Caller, item_id: str, reason: str, not_before: datetime | None = None
+    ) -> Item:
+        """Give a run's claim back: the item returns to the queue, with one more release.
+
+        The dispatcher, for any run; a run, for its own claim. `not_before` is for a
+        `deploy-check` only: the time it returns to the queue.
+        """
+        async with self._as(caller) as conn:
+            cur = await conn.execute(
+                "SELECT release_claim(%s, %s, %s)", (item_id, reason, not_before)
+            )
+            if await cur.fetchone() != (True,):
+                raise ItemNotFound(f"no item {item_id}")
+            item = await self._fetch(conn, item_id)
+        assert item is not None
+        return item
+
+    async def expire_claims(self, caller: Caller, holder: str) -> list[Expired]:
+        """Count the claims that ran out: each item is open and unclaimed again. The
+        dispatcher only. Two in a row on one item write a decision item, held by `holder`."""
+        async with self._as(caller) as conn:
+            cur = await conn.execute("SELECT * FROM expire_claims(%s)", (holder,))
+            return [Expired(*row) for row in await cur.fetchall()]
+
+    async def run_for_token(self, token: str) -> RunToken | None:
+        """Whose run token this is, or None for one that is unknown or dead. Asked as the
+        pool's own login, before any caller is known."""
+        async with self._pool.connection() as conn:
+            cur = await conn.execute("SELECT * FROM run_of_token(%s)", (token_sha256(token),))
+            row = await cur.fetchone()
+        return None if row is None else RunToken(*row)
 
     async def stats(self, caller: Caller) -> Stats:
         """Counts for the metrics: open items, closed ones and per issue, and no item's text."""

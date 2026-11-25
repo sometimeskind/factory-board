@@ -20,6 +20,7 @@ OTHER_SESSION = Caller(Tier.AGENT, "session:9z8y7x6w")
 RUN = Caller(Tier.AGENT, "run:20260101-work-01")
 RECONCILER = Caller(Tier.PROCESS, "process:reconciler")
 NIGHTLY = Caller(Tier.PROCESS, "process:nightly")
+DISPATCHER = Caller(Tier.PROCESS, "process:dispatcher")
 
 REPO = "example/repo"
 SHA_A = "a" * 40

@@ -117,6 +117,7 @@ The tier belongs to the token (`factory_board/auth.py`), and is checked on every
 | An interactive session | The session token, with the session's ID in the `X-Factory-Board-Session` header | `session:<id>` | `board_agent` |
 | The nightly | The nightly token | `process:nightly` | `board_process` |
 | The reconciler | The reconciler token | `process:reconciler` | `board_process` |
+| The dispatcher | The dispatcher token | `process:dispatcher` | `board_process` |
 
 - A static token is accepted only when the route header is exactly `private`. The private
   route must set that header and the public route must set it to `public`; a route that
@@ -136,10 +137,11 @@ port of their own. A tool outside the caller's row is refused.
 | Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
 | Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `get_item`, `list_pipeline_items`, `list_assessments` |
+| Dispatcher | `list_claimable`, `claim`, `release`, `get_item`, `list_pipeline_items`, `list_assessments` |
 
 The operator and a session also have `list_pipeline_items` and `list_assessments`: the
-pipeline's queue can be read by every caller but the nightly. The two processes share a tier
-and are told apart by identity.
+pipeline's queue can be read by every caller but the nightly. The three processes share a
+tier and are told apart by identity.
 
 - `write_stage_item` writes an `assess`, `review`, `merge`, `deploy-check` or continuing
   `work` item, held by nobody. One is open per stage and subject. A second `assess` trigger
@@ -151,6 +153,41 @@ and are told apart by identity.
 - `close_for_fact` closes a PR item the reconciler holds (done or superseded) or a stage
   item nobody holds (superseded only), with `{"cause": <name>}` as the result. The policy
   `items_update_reconciler` allows the second for `process:reconciler` alone.
+
+### Claims
+
+A stage's item is held by nobody until the dispatcher claims it for one run
+(`migrations/0008_claims.sql`). The rules are functions in Postgres that run as the owner and
+check the caller; no tier may write the claim columns or the counters.
+
+- `list_claimable` first counts the claims that ran out, then lists the queue: every open
+  item of a stage that nobody holds, whose `not_before` has come and that waits on no open
+  item, without `merge` items. The order is the `claimable` view's rank (1 anything urgent,
+  then `health`, `digest`, `review`, `deploy-check`, `assess`, `work`, `retro`), then the
+  oldest. `last_claims` are the two claims made last, for the dispatcher's alternation rule.
+- `claim` takes the item, a run ID (used once, ever) and the stage's time cap in minutes.
+  The run holds the item as `run:<id>` until ten minutes after the cap. The answer carries
+  the run's token, once; the `claims` table keeps its SHA-256, in a column no tier can read.
+  `run_of_token` says whose token it is while the claim runs: the token is dead when the
+  item closes, or the claim is released or runs out. Nothing accepts a run's token over HTTP
+  yet; that comes with the stages.
+- `claim` takes the issue's current staleness hash for an `assess` item (it is stamped as
+  `input_hash`) and for a `work` item that carries one: when they differ, the item closes as
+  superseded (`{"cause": "stale"}`), the answer's status is `stale`, and nothing is claimed.
+- `release` gives a claim back with a reason (`start-failed`, `infra-window`, `usage-limit`,
+  `stopped`, `not-live`). The item returns to the queue at once and `releases` goes up; a
+  `deploy-check` may name a `not_before`, at most a day ahead. In the database a run may
+  release its own claim too.
+- A claim that runs out leaves the item open and unclaimed, with `expiries` one up. A run
+  whose claim has run out can no longer close its item, counted or not.
+- **Two expiries in a row** on one item (releases in between are skipped) write a `decision`
+  item for the operator, about the item's subject and urgent if the item is. The item waits
+  on it (the one edge the board writes after an item exists), so it is in no queue. The
+  decision's first option, "try again", lets the item go for two more runs. Any other close
+  of the decision (its second option, the operator's own text, a reject, a reply) closes the
+  item as superseded; `answer` names it under `also_closed`.
+- `get_item` shows a stage item's `claims`: each run, when it claimed, and how the claim
+  ended (`closed`, `released` with its reason, `expired`).
 
 - `done`, `answer` and `defer` work on an item a person holds. `reply` closes such an item
   as replied; on an item someone else holds it attaches the reply and leaves it open.
@@ -189,7 +226,8 @@ and are told apart by identity.
 | `FACTORY_BOARD_PORT`, `FACTORY_BOARD_METRICS_PORT` | The MCP's port (8000) and the metrics' (9090) |
 | `FACTORY_BOARD_SESSION_TOKEN_SHA256` | The SHA-256 of the interactive sessions' token. Unset, that token is off |
 | `FACTORY_BOARD_NIGHTLY_TOKEN_SHA256` | The SHA-256 of the nightly's token. Unset, that token is off |
-| `FACTORY_BOARD_RECONCILER_TOKEN_SHA256` | The SHA-256 of the reconciler's token. Unset, that token is off. The three hashes must differ |
+| `FACTORY_BOARD_RECONCILER_TOKEN_SHA256` | The SHA-256 of the reconciler's token. Unset, that token is off |
+| `FACTORY_BOARD_DISPATCHER_TOKEN_SHA256` | The SHA-256 of the dispatcher's token. Unset, that token is off. The four hashes must differ |
 
 `python -m factory_board migrate` applies the pending migrations and exits. A command asks
 only for the URL it needs, and fails by name when that one is missing.
