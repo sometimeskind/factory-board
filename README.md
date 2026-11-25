@@ -137,12 +137,14 @@ port of their own. A tool outside the caller's row is refused.
 | Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump` |
 | Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
-| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `get_item`, `list_pipeline_items`, `list_assessments` |
+| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `list_items`, `get_item`, `list_pipeline_items`, `list_assessments` |
 | Dispatcher | `list_claimable`, `claim`, `release`, `get_item`, `list_pipeline_items`, `list_assessments` |
 
 The operator and a session also have `list_pipeline_items` and `list_assessments`: the
 pipeline's queue can be read by every caller but the nightly. The three processes share a
 tier and are told apart by identity.
+The reconciler also has `list_items`, for its orphaned sweep: an issue with an open item of
+the operator's is not orphaned.
 
 - `write_stage_item` writes an `assess`, `review`, `merge`, `deploy-check` or continuing
   `work` item, held by nobody. One is open per stage and subject. A second `assess` trigger
