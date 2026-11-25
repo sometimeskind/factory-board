@@ -418,7 +418,9 @@ def build_server(
             )
             return {"items": [view(item) for item in items]}
 
-        return await call("list_items", READERS, run)
+        # The reconciler reads them for its orphaned sweep: an issue with an open item of the
+        # operator's is not orphaned.
+        return await call("list_items", READERS | RECONCILER, run)
 
     async def get_item(item_id: ItemId) -> dict[str, Any]:
         """One item, open or closed, with the operator's replies on it, and for a stage's

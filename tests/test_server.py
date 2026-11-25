@@ -72,7 +72,13 @@ TOOLS = {
     "operator": {"list_items", "done", "answer", "reply", "defer", "reject", "bump"} | READS,
     "session": {"create_item", "list_items", "update_pr_head"} | READS,
     "nightly": {"create_keyed_item", "list_own_items", "close_own_item"},
-    "reconciler": {"write_stage_item", "write_operator_item", "close_for_fact", "heartbeat"}
+    "reconciler": {
+        "list_items",
+        "write_stage_item",
+        "write_operator_item",
+        "close_for_fact",
+        "heartbeat",
+    }
     | READS,
     "dispatcher": {"list_claimable", "claim", "release"} | READS,
 }
@@ -147,6 +153,12 @@ async def test_a_tool_outside_the_tier_s_row_is_refused(
         with pytest.raises(ToolError, match="not a tool of this caller's tier"):
             await board.call(identity, tool, **CALLS[tool])
     assert await store.list_open(OPERATOR, include_deferred=True) == []
+
+
+async def test_the_reconciler_lists_the_operator_s_items(board: Board) -> None:
+    item = (await board.call(AS_SESSION, "create_item", item=MANUAL))["item"]
+    listed = (await board.call(AS_RECONCILER, "list_items", include_deferred=True))["items"]
+    assert [entry["id"] for entry in listed] == [item["id"]]
 
 
 async def test_an_item_done_elsewhere_shows_its_place(board: Board) -> None:
