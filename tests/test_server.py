@@ -14,7 +14,18 @@ from typing import Any
 import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from helpers import DISPATCHER, NIGHTLY, OPERATOR, RECONCILER, REPO, RUN, SESSION, SHA_A, SHA_B
+from helpers import (
+    DISPATCHER,
+    NIGHTLY,
+    OPERATOR,
+    RECONCILER,
+    REPO,
+    RUN,
+    SESSION,
+    SHA_A,
+    SHA_B,
+    seat_of,
+)
 from prometheus_client import REGISTRY
 
 from factory_board import metrics
@@ -89,6 +100,7 @@ TOOLS = {
         "write_operator_item",
         "close_for_fact",
         "heartbeat",
+        "pause",
     }
     | READS,
     "dispatcher": {"list_claimable", "claim", "release"} | READS,
@@ -116,7 +128,12 @@ CALLS: dict[str, dict[str, Any]] = {
     "close_for_fact": {"item_id": "abcdefgh", "cause": "merged"},
     "heartbeat": {},
     "list_claimable": {},
-    "claim": {"item_id": "abcdefgh", "run_id": "20260101-review-01", "cap_minutes": 30},
+    "claim": {
+        "item_id": "abcdefgh",
+        "run_id": "20260101-review-01",
+        "cap_minutes": 30,
+        "seat": "review/1",
+    },
     "release": {"item_id": "abcdefgh", "reason": "stopped"},
     "pause": {"reason": "the widget press is being moved"},
     "resume": {},
@@ -765,6 +782,8 @@ async def staged(board: Board, item: dict[str, Any], **arguments: Any) -> str:
 
 
 async def claim(board: Board, item_id: str, run_id: str, **arguments: Any) -> dict[str, Any]:
+    """Claim as the dispatcher, from the seat the run's ID names unless one is given."""
+    arguments = {"seat": seat_of(run_id)} | arguments
     return await board.call(
         AS_DISPATCHER, "claim", item_id=item_id, run_id=run_id, cap_minutes=30, **arguments
     )
@@ -801,7 +820,9 @@ async def test_the_three_processes_do_not_share_their_tools(board: Board) -> Non
     item_id = await staged(board, REVIEW)
     for identity in (AS_RECONCILER, AS_NIGHTLY, AS_SESSION, AS_OPERATOR):
         with pytest.raises(ToolError, match="not a tool of this caller's tier"):
-            await board.call(identity, "claim", item_id=item_id, run_id="r1", cap_minutes=30)
+            await board.call(
+                identity, "claim", item_id=item_id, run_id="r1", cap_minutes=30, seat="review/1"
+            )
     with pytest.raises(ToolError, match="not a tool of this caller's tier"):
         await board.call(AS_DISPATCHER, "close_for_fact", item_id=item_id, cause="merged")
     # It reads what the reconciler reads.
@@ -818,6 +839,7 @@ async def test_the_queue_lists_what_ran_out_the_items_and_the_last_claims(
         "expired": [],
         "items": [],
         "last_claims": [],
+        "running": [],
         "paused": None,
     }
     review = await staged(board, REVIEW)
@@ -869,7 +891,12 @@ async def test_a_claim_answers_with_the_run_s_token_once(
     caplog.set_level(logging.DEBUG)
     item_id = await staged(board, REVIEW)
     claimed = await board.call(
-        AS_DISPATCHER, "claim", item_id=item_id, run_id="20260101-review-01", cap_minutes=45
+        AS_DISPATCHER,
+        "claim",
+        item_id=item_id,
+        run_id="20260101-review-01",
+        cap_minutes=45,
+        seat="review/1",
     )
     assert (claimed["status"], claimed["confirmation"]) == ("claimed", REVIEW_LABEL)
     token = claimed["token"]
@@ -888,6 +915,7 @@ async def test_a_claim_answers_with_the_run_s_token_once(
                 "run": "20260101-review-01",
                 "item": item_id,
                 "stage": "review",
+                "seat": "review/1",
                 "urgent": False,
                 "claimed_at": shown["claims"][0]["claimed_at"],
                 "expires": shown["claim_expires"],
@@ -930,11 +958,23 @@ async def test_a_claim_answers_with_the_run_s_token_once(
         {"input_hash": ""},
         {"token": "mine"},
         {"claimed_by": "run:20260101-review-09"},
+        {"seat": "assess"},
+        {"seat": "assess/0"},
+        {"seat": "review/1"},
+        {"seat": "assess/urgent-1"},
+        {"seat": None},
     ],
 )
 async def test_a_claim_is_checked(board: Board, bad: dict[str, Any]) -> None:
     item_id = await staged(board, ASSESS)
-    arguments = {"item_id": item_id, "run_id": "20260101-assess-01", "cap_minutes": 30} | bad
+    good = {
+        "item_id": item_id,
+        "run_id": "20260101-assess-01",
+        "cap_minutes": 30,
+        "input_hash": "h1",
+        "seat": "assess/1",
+    }
+    arguments = good | bad
     with pytest.raises(ToolError):
         await board.call(AS_DISPATCHER, "claim", **arguments)
     assert (await board.call(AS_DISPATCHER, "get_item", item_id=item_id))["held_by"] is None
@@ -1100,6 +1140,7 @@ async def test_two_expiries_in_a_row_ask_the_operator(
         "expired": [],
         "items": [],
         "last_claims": (await queue(board))["last_claims"],
+        "running": [],
         "paused": None,
     }
     with pytest.raises(ToolError, match="is not claimable"):

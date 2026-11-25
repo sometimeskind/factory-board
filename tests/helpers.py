@@ -119,3 +119,26 @@ def row_of(conn: psycopg.Connection, item_id: str) -> tuple[Any, ...]:
     row = conn.execute("SELECT * FROM items WHERE id = %s", (item_id,)).fetchone()
     assert row is not None
     return row
+
+
+def seat_of(run: str) -> str:
+    """The seat a made-up run sits in: `20260101-review-02` sits in `review/2`."""
+    stage_name, _, number = run.split("-", 1)[1].rpartition("-")
+    return f"{stage_name}/{int(number)}"
+
+
+FREE_SEAT = """
+    SELECT i.kind || '/' || (
+        SELECT min(n) FROM generate_series(1, 99) AS n
+        WHERE NOT EXISTS (
+            SELECT FROM claims AS c WHERE c.ended_at IS NULL AND c.seat = i.kind || '/' || n
+        )
+    )
+    FROM items AS i WHERE i.id = %s
+"""
+
+
+def free_seat(conn: psycopg.Connection, item_id: str) -> str:
+    """The first free normal seat at the item's stage; `review/1` for an item that is not there."""
+    row = conn.execute(FREE_SEAT, (item_id,)).fetchone()
+    return "review/1" if row is None else row[0]

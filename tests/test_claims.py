@@ -23,6 +23,7 @@ from helpers import (
     issue,
     manual,
     pr,
+    seat_of,
     stage,
 )
 
@@ -68,7 +69,7 @@ def lapse(conn: psycopg.Connection, item_id: str) -> None:
 
 async def run_out(store: Store, conn: psycopg.Connection, item_id: str, run: str) -> Expired:
     """One claim that runs out and is counted."""
-    await store.claim_item(DISPATCHER, item_id, run, 30)
+    await store.claim_item(DISPATCHER, item_id, run, 30, seat=seat_of(run))
     lapse(conn, item_id)
     expired = await store.expire_claims(DISPATCHER, OPERATOR.identity)
     assert [(entry.item_id, entry.run) for entry in expired] == [(item_id, run)]
@@ -98,13 +99,13 @@ async def test_the_queue_is_ranked_then_oldest(store: Store) -> None:
     for caller in (DISPATCHER, OPERATOR, SESSION, RECONCILER):
         assert await store.list_claimable(caller) == expected
 
-    await store.claim_item(DISPATCHER, reviewed.id, "20260101-review-01", 30)
+    await store.claim_item(DISPATCHER, reviewed.id, "20260101-review-01", 30, seat="review/1")
     assert await store.list_claimable(DISPATCHER) == [expected[0], *expected[2:]]
 
 
 async def test_a_claim_returns_the_run_s_token_once(store: Store) -> None:
     item = await review(store)
-    claimed = await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 45)
+    claimed = await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 45, seat="review/1")
     assert claimed.stale is False
     assert claimed.token is not None and len(claimed.token) >= 43
     held = claimed.item
@@ -124,7 +125,7 @@ async def test_a_claim_returns_the_run_s_token_once(store: Store) -> None:
 
     # Another claim mints another token.
     second = await review(store, 203)
-    again = await store.claim_item(DISPATCHER, second.id, "20260101-review-02", 45)
+    again = await store.claim_item(DISPATCHER, second.id, "20260101-review-02", 45, seat="review/2")
     assert again.token is not None and again.token != claimed.token
     assert await store.run_for_token(again.token) == RunToken(
         "20260101-review-02", second.id, "review"
@@ -135,7 +136,7 @@ async def test_a_claim_keeps_the_hash_of_the_token_and_not_the_token(
     store: Store, conn: psycopg.Connection
 ) -> None:
     item = await review(store)
-    claimed = await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 45)
+    claimed = await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 45, seat="review/1")
     assert claimed.token is not None
     rows = conn.execute("SELECT token_sha256 FROM claims").fetchall()
     assert rows == [(token_sha256(claimed.token),)]
@@ -150,7 +151,7 @@ async def test_a_claim_keeps_the_hash_of_the_token_and_not_the_token(
 async def test_only_the_dispatcher_claims_and_counts(store: Store, caller: Caller) -> None:
     item = await review(store)
     with pytest.raises(NotPermitted):
-        await store.claim_item(caller, item.id, "20260101-review-01", 30)
+        await store.claim_item(caller, item.id, "20260101-review-01", 30, seat="review/1")
     with pytest.raises(NotPermitted):
         await store.expire_claims(caller, OPERATOR.identity)
     assert await store.get_item(OPERATOR, item.id) == item
@@ -159,45 +160,51 @@ async def test_only_the_dispatcher_claims_and_counts(store: Store, caller: Calle
 
 async def test_what_a_claim_is_refused_for(store: Store) -> None:
     item = await review(store)
-    await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 30)
+    await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 30, seat="review/1")
     with pytest.raises(NotClaimable, match="held by run:20260101-review-01"):
-        await store.claim_item(DISPATCHER, item.id, "20260101-review-02", 30)
+        await store.claim_item(DISPATCHER, item.id, "20260101-review-02", 30, seat="review/2")
     with pytest.raises(NotClaimable, match="no item zzzzzzzz"):
-        await store.claim_item(DISPATCHER, "zzzzzzzz", "20260101-review-02", 30)
+        await store.claim_item(DISPATCHER, "zzzzzzzz", "20260101-review-02", 30, seat="review/2")
     operators = (await store.create_item(SESSION, manual(101))).item
     with pytest.raises(NotClaimable, match="not claimable"):
-        await store.claim_item(DISPATCHER, operators.id, "20260101-review-02", 30)
+        await store.claim_item(DISPATCHER, operators.id, "20260101-review-02", 30, seat="review/2")
 
     other = await review(store, 203)
     with pytest.raises(InvalidItem, match="has claimed before"):
-        await store.claim_item(DISPATCHER, other.id, "20260101-review-01", 30)
+        await store.claim_item(DISPATCHER, other.id, "20260101-review-01", 30, seat="review/1")
     for run, cap in (("not a run", 30), ("", 30), ("20260101-review-02", 0)):
         with pytest.raises(InvalidItem):
-            await store.claim_item(DISPATCHER, other.id, run, cap)
+            await store.claim_item(DISPATCHER, other.id, run, cap, seat="review/2")
     with pytest.raises(InvalidItem, match="only an assess item"):
-        await store.claim_item(DISPATCHER, other.id, "20260101-review-02", 30, "h1")
+        await store.claim_item(
+            DISPATCHER, other.id, "20260101-review-02", 30, "h1", seat="review/2"
+        )
     assert await store.get_item(OPERATOR, other.id) == other
 
     await store.close_item(RECONCILER, other.id, Resolution.SUPERSEDED, {"cause": "merged"})
     with pytest.raises(ItemClosed):
-        await store.claim_item(DISPATCHER, other.id, "20260101-review-02", 30)
+        await store.claim_item(DISPATCHER, other.id, "20260101-review-02", 30, seat="review/2")
 
 
 async def test_an_assess_item_is_stamped_and_a_stale_work_item_is_closed(store: Store) -> None:
     assess = (await store.create_item(RECONCILER, stage("assess", 101))).item
     with pytest.raises(InvalidItem, match="claimed with the issue's hash"):
-        await store.claim_item(DISPATCHER, assess.id, "20260101-assess-01", 30)
-    claimed = await store.claim_item(DISPATCHER, assess.id, "20260101-assess-01", 30, "h2")
+        await store.claim_item(DISPATCHER, assess.id, "20260101-assess-01", 30, seat="assess/1")
+    claimed = await store.claim_item(
+        DISPATCHER, assess.id, "20260101-assess-01", 30, "h2", seat="assess/1"
+    )
     assert (claimed.stale, claimed.item.input_hash) == (False, "h2")
 
     fresh = replace(stage("work", 102), input_hash="h1")
     same = (await store.create_item(RECONCILER, fresh)).item
-    kept = await store.claim_item(DISPATCHER, same.id, "20260101-work-01", 30, "h1")
+    kept = await store.claim_item(DISPATCHER, same.id, "20260101-work-01", 30, "h1", seat="work/1")
     assert (kept.stale, kept.item.claimed_by) == (False, "run:20260101-work-01")
     assert kept.token is not None
 
     stale = (await store.create_item(RECONCILER, replace(fresh, subject=issue(103)))).item
-    closed = await store.claim_item(DISPATCHER, stale.id, "20260101-work-02", 30, "h2")
+    closed = await store.claim_item(
+        DISPATCHER, stale.id, "20260101-work-02", 30, "h2", seat="work/2"
+    )
     assert closed.stale is True and closed.token is None
     assert (closed.item.is_open, closed.item.resolution) == (False, Resolution.SUPERSEDED)
     assert closed.item.result == {"cause": "stale", "input_hash": "h2"}
@@ -210,7 +217,7 @@ async def test_an_assess_item_is_stamped_and_a_stale_work_item_is_closed(store: 
 
 async def test_a_release_gives_the_item_back(store: Store) -> None:
     item = await review(store)
-    claimed = await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 30)
+    claimed = await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 30, seat="review/1")
     assert claimed.token is not None
     released = await store.release_claim(DISPATCHER, item.id, "usage-limit")
     assert released == replace(item, releases=1)
@@ -226,7 +233,7 @@ async def test_a_release_gives_the_item_back(store: Store) -> None:
         await store.release_claim(DISPATCHER, item.id, "stopped")
     with pytest.raises(ItemNotFound):
         await store.release_claim(DISPATCHER, "zzzzzzzz", "stopped")
-    await store.claim_item(DISPATCHER, item.id, "20260101-review-02", 30)
+    await store.claim_item(DISPATCHER, item.id, "20260101-review-02", 30, seat="review/2")
     with pytest.raises(InvalidItem, match="short lower-case name"):
         await store.release_claim(DISPATCHER, item.id, "Not A Name")
     with pytest.raises(InvalidItem, match="only a deploy-check"):
@@ -238,7 +245,7 @@ async def test_a_release_gives_the_item_back(store: Store) -> None:
 
 async def test_a_run_releases_its_own_claim_and_no_other(store: Store) -> None:
     item = await review(store)
-    await store.claim_item(DISPATCHER, item.id, RUN_ID, 30)
+    await store.claim_item(DISPATCHER, item.id, RUN_ID, 30, seat="review/1")
     for caller in (OTHER_RUN, SESSION, NIGHTLY, RECONCILER, OPERATOR):
         with pytest.raises(NotPermitted):
             await store.release_claim(caller, item.id, "stopped")
@@ -249,7 +256,9 @@ async def test_a_run_releases_its_own_claim_and_no_other(store: Store) -> None:
 async def test_a_deploy_check_is_released_until_a_later_time(store: Store) -> None:
     new = replace(stage("deploy-check"), subject=pr(202))
     item = (await store.create_item(RECONCILER, new)).item
-    await store.claim_item(DISPATCHER, item.id, "20260101-deploy-check-01", 30)
+    await store.claim_item(
+        DISPATCHER, item.id, "20260101-deploy-check-01", 30, seat="deploy-check/1"
+    )
     for bad in (timedelta(minutes=-1), timedelta(hours=25)):
         with pytest.raises(InvalidItem, match="at most a day ahead"):
             await store.release_claim(DISPATCHER, item.id, "not-live", datetime.now(UTC) + bad)
@@ -264,8 +273,8 @@ async def test_a_claim_that_ran_out_expires_and_is_not_released(
 ) -> None:
     item = await review(store)
     running = await review(store, 203)
-    claimed = await store.claim_item(DISPATCHER, item.id, RUN_ID, 30)
-    await store.claim_item(DISPATCHER, running.id, "20260101-review-02", 30)
+    claimed = await store.claim_item(DISPATCHER, item.id, RUN_ID, 30, seat="review/1")
+    await store.claim_item(DISPATCHER, running.id, "20260101-review-02", 30, seat="review/2")
     assert claimed.token is not None
     assert await store.expire_claims(DISPATCHER, OPERATOR.identity) == []
 
@@ -289,7 +298,7 @@ async def test_a_claim_that_ran_out_expires_and_is_not_released(
 
 async def test_a_run_closes_its_item_within_its_claim(store: Store) -> None:
     item = await review(store)
-    claimed = await store.claim_item(DISPATCHER, item.id, RUN_ID, 30)
+    claimed = await store.claim_item(DISPATCHER, item.id, RUN_ID, 30, seat="review/1")
     assert claimed.token is not None
     with pytest.raises(NotPermitted):
         await store.close_item(OTHER_RUN, item.id, Resolution.DONE)
@@ -327,7 +336,7 @@ async def test_two_expiries_in_a_row_write_a_decision_the_item_waits_on(
     assert waiting.after == waiting.waiting_on == (decision.id,)
     assert await store.list_claimable(DISPATCHER) == []
     with pytest.raises(NotClaimable):
-        await store.claim_item(DISPATCHER, item.id, "20260101-work-03", 30)
+        await store.claim_item(DISPATCHER, item.id, "20260101-work-03", 30, seat="work/3")
 
     claims = await store.list_claims(SESSION, item.id)
     assert [(c.run, c.item_id, c.stage, c.urgent, c.ending, c.decision_id) for c in claims] == [
@@ -342,12 +351,12 @@ async def test_the_last_claims_are_the_newest_first(store: Store, conn: psycopg.
     assess = (await store.create_item(RECONCILER, stage("assess", 101))).item
     work = (await store.create_item(RECONCILER, replace(stage("work", 102), urgent=True))).item
     reviewed = await review(store)
-    await store.claim_item(DISPATCHER, assess.id, "20260101-assess-01", 30, "h1")
+    await store.claim_item(DISPATCHER, assess.id, "20260101-assess-01", 30, "h1", seat="assess/1")
     await store.release_claim(DISPATCHER, assess.id, "infra-window")
-    await store.claim_item(DISPATCHER, work.id, RUN_ID, 30)
+    await store.claim_item(DISPATCHER, work.id, RUN_ID, 30, seat="work/1")
     await store.close_item(RUN, work.id, Resolution.DONE)
     await run_out(store, conn, reviewed.id, "20260101-review-01")
-    await store.claim_item(DISPATCHER, assess.id, "20260101-assess-02", 30, "h1")
+    await store.claim_item(DISPATCHER, assess.id, "20260101-assess-02", 30, "h1", seat="assess/2")
 
     def told(claims: list[Claim]) -> list[tuple[str, str, bool, str | None, str | None]]:
         return [(c.run, c.stage, c.urgent, c.ending, c.reason) for c in claims]
@@ -418,3 +427,70 @@ async def test_a_reject_of_the_decision_closes_the_item_too(
     closed = await store.get_item(OPERATOR, item.id)
     assert closed.result == {"cause": "after", "item": decision, "resolution": "rejected"}
     assert await store.list_cascaded(OPERATOR, decision) == [closed]
+
+
+# ---- the seat ----
+
+
+async def test_a_claim_sits_in_its_seat_until_it_ends(store: Store) -> None:
+    first = await review(store)
+    second = await review(store, 203)
+    await store.claim_item(DISPATCHER, first.id, "20260101-review-01", 30, seat="review/1")
+    [running] = await store.running_claims(DISPATCHER)
+    assert (running.run, running.seat, running.stage) == (
+        "20260101-review-01",
+        "review/1",
+        "review",
+    )
+    assert [claim.seat for claim in await store.list_claims(OPERATOR, first.id)] == ["review/1"]
+
+    with pytest.raises(NotClaimable, match="seat review/1 is taken by run 20260101-review-01"):
+        await store.claim_item(DISPATCHER, second.id, "20260101-review-02", 30, seat="review/1")
+    assert await store.get_item(OPERATOR, second.id) == second
+
+    # However the claim ends, the seat is free again: a release, then a close.
+    await store.release_claim(DISPATCHER, first.id, "stopped")
+    assert await store.running_claims(DISPATCHER) == []
+    await store.claim_item(DISPATCHER, second.id, "20260101-review-02", 30, seat="review/1")
+    await store.close_item(
+        Caller(Tier.AGENT, "run:20260101-review-02"), second.id, Resolution.DONE, {}
+    )
+    await store.claim_item(DISPATCHER, first.id, "20260101-review-03", 30, seat="review/1")
+    assert [claim.seat for claim in await store.last_claims(DISPATCHER)] == ["review/1"] * 2
+
+
+async def test_a_claim_that_ran_out_keeps_its_seat_until_it_is_counted(
+    store: Store, conn: psycopg.Connection
+) -> None:
+    first = await review(store)
+    second = await review(store, 203)
+    await store.claim_item(DISPATCHER, first.id, "20260101-review-01", 30, seat="review/1")
+    lapse(conn, first.id)
+    with pytest.raises(NotClaimable, match="seat review/1 is taken"):
+        await store.claim_item(DISPATCHER, second.id, "20260101-review-02", 30, seat="review/1")
+    await store.expire_claims(DISPATCHER, OPERATOR.identity)
+    await store.claim_item(DISPATCHER, second.id, "20260101-review-02", 30, seat="review/1")
+
+
+async def test_a_seat_is_at_the_item_s_stage_and_an_urgent_one_takes_urgent_items(
+    store: Store,
+) -> None:
+    item = await review(store)
+    for seat, why in (
+        ("work/1", "seat work/1 is not at the review stage"),
+        ("review/urgent-1", "is for an urgent item"),
+        ("review", "a seat is <stage>/<n>"),
+        ("review/0", "a seat is <stage>/<n>"),
+    ):
+        with pytest.raises(InvalidItem, match=why):
+            await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 30, seat=seat)
+    assert await store.get_item(OPERATOR, item.id) == item
+
+    await store.set_urgent(OPERATOR, item.id, True)
+    await store.claim_item(DISPATCHER, item.id, "20260101-review-01", 30, seat="review/urgent-1")
+    # An urgent item also sits in a normal seat: urgent is taken first everywhere.
+    other = await review(store, 203)
+    await store.set_urgent(OPERATOR, other.id, True)
+    await store.claim_item(DISPATCHER, other.id, "20260101-review-02", 30, seat="review/1")
+    seats = [claim.seat for claim in await store.running_claims(DISPATCHER)]
+    assert seats == ["review/urgent-1", "review/1"]

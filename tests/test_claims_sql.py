@@ -26,9 +26,11 @@ from helpers import (
     RUN,
     SESSION,
     as_tier,
+    free_seat,
     insert_row,
     insert_stage_row,
     row_of,
+    seat_of,
 )
 from psycopg import errors
 from psycopg.types.json import Jsonb
@@ -42,7 +44,7 @@ RUN_ID = RUN.identity.partition(":")[2]
 EVERY_TIER = [OPERATOR, SESSION, DISPATCHER]
 NOT_THE_DISPATCHER = [NIGHTLY, RECONCILER, SESSION, RUN, OPERATOR]
 
-CLAIM = "SELECT claim_item(%s, %s, %s, %s, %s)"
+CLAIM = "SELECT claim_item(%s, %s, %s, %s, %s, %s)"
 RELEASE = "SELECT release_claim(%s, %s, %s)"
 EXPIRE = "SELECT * FROM expire_claims(%s)"
 TOKEN = "SELECT * FROM run_of_token(%s)"
@@ -75,11 +77,19 @@ def sha(token: str) -> str:
 
 
 def claim(
-    app_url: str, item_id: str, run: str, cap: int = 30, current_hash: str | None = None
+    app_url: str,
+    item_id: str,
+    run: str,
+    cap: int = 30,
+    current_hash: str | None = None,
+    seat: str | None = None,
 ) -> str:
-    """Claim as the dispatcher; the function's answer."""
+    """Claim as the dispatcher, from a free seat at the item's stage unless one is given;
+    the function's answer."""
     with as_tier(app_url, DISPATCHER) as conn:
-        row = conn.execute(CLAIM, (item_id, run, cap, sha(run), current_hash)).fetchone()
+        row = conn.execute(
+            CLAIM, (item_id, run, cap, sha(run), current_hash, seat or free_seat(conn, item_id))
+        ).fetchone()
     assert row is not None
     return row[0]
 
@@ -166,7 +176,7 @@ def test_only_the_dispatcher_claims_and_counts_expiries(
 ) -> None:
     before = row_of(owner, item)
     with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
-        conn.execute(CLAIM, (item, "20260101-review-01", 30, sha("t"), None))
+        conn.execute(CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "review/1"))
     with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
         conn.execute(EXPIRE, (OPERATOR.identity,))
     assert row_of(owner, item) == before
@@ -178,7 +188,7 @@ def test_a_process_whose_actor_is_not_the_dispatcher_claims_nothing(
     app_url: str, item: str, actor: str | None
 ) -> None:
     for statement, arguments in (
-        (CLAIM, (item, "20260101-review-01", 30, sha("t"), None)),
+        (CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "review/1")),
         (EXPIRE, (OPERATOR.identity,)),
         (RELEASE, (item, "stopped", None)),
     ):
@@ -476,11 +486,15 @@ def test_a_run_claims_once(app_url: str, owner: psycopg.Connection, item: str) -
     assert state(owner, OTHER) == (None, None, 0, 0, True)
     # Nor does one token serve two runs.
     with pytest.raises(errors.UniqueViolation), as_tier(app_url, DISPATCHER) as conn:
-        conn.execute(CLAIM, (OTHER, "20260101-review-02", 30, sha("20260101-review-01"), None))
+        conn.execute(
+            CLAIM,
+            (OTHER, "20260101-review-02", 30, sha("20260101-review-01"), None, "review/2"),
+        )
     assert state(owner, OTHER) == (None, None, 0, 0, True)
 
 
-GOOD = ("20260101-review-01", 30, "a" * 64, None)
+GOOD = ("20260101-review-01", 30, "a" * 64, None, "review/1")
+BAD_SEATS = (None, "", "review", "review/0", "review/100", "Review/1", "review/urgent", "/1")
 
 
 @pytest.mark.parametrize(
@@ -488,8 +502,12 @@ GOOD = ("20260101-review-01", 30, "a" * 64, None)
     [
         *[(run, *GOOD[1:]) for run in (None, "", "-leading", "has space", "a:b", "x" * 101)],
         *[(GOOD[0], cap, *GOOD[2:]) for cap in (None, 0, -5, 1441)],
-        *[(*GOOD[:2], token, None) for token in (None, "", "abc", "A" * 64, "a" * 65, "g" * 64)],
-        *[(*GOOD[:3], current) for current in ("", "has space", "h\n", "x" * 129)],
+        *[
+            (*GOOD[:2], token, *GOOD[3:])
+            for token in (None, "", "abc", "A" * 64, "a" * 65, "g" * 64)
+        ],
+        *[(*GOOD[:3], current, GOOD[4]) for current in ("", "has space", "h\n", "x" * 129)],
+        *[(*GOOD[:4], seat) for seat in BAD_SEATS],
     ],
 )
 def test_a_claim_with_a_bad_value_is_refused(
@@ -524,7 +542,7 @@ def test_two_claims_of_one_item_at_once_and_one_wins(
         try:
             with as_tier(app_url, DISPATCHER) as conn:
                 together.wait(timeout=10)
-                row = conn.execute(CLAIM, (item, run, 30, sha(run), None)).fetchone()
+                row = conn.execute(CLAIM, (item, run, 30, sha(run), None, seat_of(run))).fetchone()
                 # Keep the row locked for a while, so the other one waits for it.
                 time.sleep(0.5)
         except psycopg.Error as exc:

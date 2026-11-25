@@ -324,12 +324,12 @@ async def test_the_stats_count_the_queue_and_the_claims(
     assert all(isinstance(q, QueueCount) and abs(q.oldest_since - now) < 300 for q in stats.queue)
 
     # A claimed item is out of the queue; a released one is back, since its release.
-    await store.claim_item(DISPATCHER, held.id, "20260101-assess-01", 30, "hash-1")
-    await store.claim_item(DISPATCHER, review.id, "20260101-review-01", 30)
+    await store.claim_item(DISPATCHER, held.id, "20260101-assess-01", 30, "hash-1", seat="assess/1")
+    await store.claim_item(DISPATCHER, review.id, "20260101-review-01", 30, seat="review/1")
     conn.execute("UPDATE items SET created_at = created_at - interval '2 hours'")
     conn.execute("UPDATE claims SET claimed_at = claimed_at - interval '2 hours'")
     await store.release_claim(DISPATCHER, review.id, "usage-limit")
-    await store.claim_item(DISPATCHER, review.id, "20260101-review-02", 30)
+    await store.claim_item(DISPATCHER, review.id, "20260101-review-02", 30, seat="review/2")
     conn.execute(
         "UPDATE items SET claim_expires = now() - interval '1 minute' WHERE id = %s", (review.id,)
     )

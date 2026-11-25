@@ -207,6 +207,8 @@ Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._
 
 # A run's ID, as an identity's name: `run:<id>` holds the item it claimed.
 RunId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")]
+# A seat: a place at a stage, normal (`review/1`) or urgent (`review/urgent-1`).
+Seat = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z-]{0,29}/(urgent-)?[1-9][0-9]?$")]
 # The staleness hash of an issue, as the reconciler computes it.
 ClaimHash = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
 
