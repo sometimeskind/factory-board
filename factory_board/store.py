@@ -368,6 +368,17 @@ class Stats:
     # When the reconciler last recorded a pass, in seconds since the epoch; None before the
     # first.
     reconciler_pass: float | None
+    # Whether the factory is paused.
+    paused: bool
+
+
+@dataclass(frozen=True)
+class Pause:
+    """The pause that stands: since when, who set it and why."""
+
+    paused_at: datetime
+    paused_by: str
+    reason: str
 
 
 def new_item_id() -> str:
@@ -1009,6 +1020,32 @@ class Store:
         assert row is not None
         return row[0]
 
+    # ---- the pause flag ----
+
+    async def pause_state(self, caller: Caller) -> Pause | None:
+        """The pause that stands, or None while the factory is not paused. Every tier."""
+        async with self._as(caller) as conn:
+            cur = await conn.execute("SELECT paused_at, paused_by, reason FROM pause")
+            row = await cur.fetchone()
+        return None if row is None else Pause(*row)
+
+    async def set_pause(self, caller: Caller, reason: str) -> tuple[Pause, bool]:
+        """Pause the factory, at the database's time. The operator only. A pause that
+        already stands is kept and returned with False."""
+        async with self._as(caller) as conn:
+            cur = await conn.execute("SELECT * FROM set_pause(%s)", (reason,))
+            row = await cur.fetchone()
+        assert row is not None
+        return Pause(*row[:3]), row[3]
+
+    async def lift_pause(self, caller: Caller) -> Pause | None:
+        """Lift the pause and return it, or None when the factory was not paused. The
+        operator only."""
+        async with self._as(caller) as conn:
+            cur = await conn.execute("SELECT * FROM lift_pause()")
+            row = await cur.fetchone()
+        return None if row is None else Pause(*row)
+
     async def stats(self, caller: Caller) -> Stats:
         """Counts for the metrics: open items, closed ones, per issue, the queue and the
         claims, and no item's text."""
@@ -1087,6 +1124,9 @@ class Store:
                 "WHERE process = 'reconciler'"
             )
             beat = await cur.fetchone()
+            cur = await conn.execute("SELECT EXISTS (SELECT FROM pause)")
+            paused = await cur.fetchone()
+            assert paused is not None
         return Stats(
             tuple(open_items),
             tuple(closed_items),
@@ -1095,6 +1135,7 @@ class Store:
             tuple(claims),
             at_limit[0],
             None if beat is None else beat[0],
+            paused[0],
         )
 
     async def list_replies(self, caller: Caller, item_id: str) -> list[Reply]:

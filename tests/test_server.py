@@ -69,7 +69,18 @@ DEPLOY_CHECK: dict[str, Any] = {
 
 READS = {"get_item", "list_pipeline_items", "list_assessments"}
 TOOLS = {
-    "operator": {"list_items", "done", "answer", "reply", "defer", "reject", "bump"} | READS,
+    "operator": {
+        "list_items",
+        "done",
+        "answer",
+        "reply",
+        "defer",
+        "reject",
+        "bump",
+        "pause",
+        "resume",
+    }
+    | READS,
     "session": {"create_item", "list_items", "update_pr_head"} | READS,
     "nightly": {"create_keyed_item", "list_own_items", "close_own_item"},
     "reconciler": {
@@ -107,6 +118,8 @@ CALLS: dict[str, dict[str, Any]] = {
     "list_claimable": {},
     "claim": {"item_id": "abcdefgh", "run_id": "20260101-review-01", "cap_minutes": 30},
     "release": {"item_id": "abcdefgh", "reason": "stopped"},
+    "pause": {"reason": "the widget press is being moved"},
+    "resume": {},
 }
 
 
@@ -801,7 +814,12 @@ async def test_the_three_processes_do_not_share_their_tools(board: Board) -> Non
 async def test_the_queue_lists_what_ran_out_the_items_and_the_last_claims(
     board: Board, conn: Any
 ) -> None:
-    assert await queue(board) == {"expired": [], "items": [], "last_claims": []}
+    assert await queue(board) == {
+        "expired": [],
+        "items": [],
+        "last_claims": [],
+        "paused": None,
+    }
     review = await staged(board, REVIEW)
     assess = await staged(board, ASSESS)
     check = await staged(board, DEPLOY_CHECK, urgent=True)
@@ -1082,6 +1100,7 @@ async def test_two_expiries_in_a_row_ask_the_operator(
         "expired": [],
         "items": [],
         "last_claims": (await queue(board))["last_claims"],
+        "paused": None,
     }
     with pytest.raises(ToolError, match="is not claimable"):
         await claim(board, item_id, "20260101-review-03")
