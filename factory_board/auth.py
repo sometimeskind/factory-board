@@ -1,6 +1,6 @@
 """Who is calling, and at which tier.
 
-Three ways in, and the tier belongs to the token:
+Four ways in, and the tier belongs to the token:
 
 - **The operator** signs in through FastMCP's OIDCProxy in front of Pocket ID (claude.ai).
   A user in the operator group is `human:<username>` at the operator tier.
@@ -8,6 +8,8 @@ Three ways in, and the tier belongs to the token:
   tier. The ID comes from a request header and is asserted, not proven: every session
   holds the same token.
 - **The nightly token** is `process:nightly` at the process tier.
+- **The reconciler token** is `process:reconciler` at the process tier. The two processes
+  share a tier and not their tools: the server tells them apart by identity.
 
 A static token is accepted only when its SHA-256 matches the configured hash *and* the
 route header (set by the private HTTPRoute, overwriting the client's) is exactly `private`.
@@ -39,11 +41,14 @@ log = logging.getLogger(__name__)
 
 SESSION = "session"
 NIGHTLY = "nightly"
+RECONCILER = "reconciler"
 
 # The header an interactive session names itself with.
 SESSION_HEADER = "X-Factory-Board-Session"
 
 NIGHTLY_IDENTITY = "process:nightly"
+# The identity migrations/0007_reconciler.sql names.
+RECONCILER_IDENTITY = "process:reconciler"
 
 # The part of an identity after the colon, as the database accepts it (set_pr_head_sha).
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
@@ -59,7 +64,7 @@ class Identity:
 
 
 class StaticTokens(TokenVerifier):
-    """The session token and the nightly token, on the private route only."""
+    """The session, nightly and reconciler tokens, on the private route only."""
 
     def __init__(
         self,
@@ -89,7 +94,8 @@ class StaticTokens(TokenVerifier):
         return request.headers.getlist(self._route_header) == ["private"]
 
     def accepts(self, token: str) -> str | None:
-        """The token's name (`session` or `nightly`), or None when it is not accepted."""
+        """The token's name (`session`, `nightly` or `reconciler`), or None when it is not
+        accepted."""
         name = self._named(token)
         if name is None:
             return None
@@ -159,6 +165,7 @@ def build_auth(settings: ServerSettings, key_value: Any) -> tuple[Any, StaticTok
         for name, sha256 in (
             (SESSION, settings.session_token_sha256),
             (NIGHTLY, settings.nightly_token_sha256),
+            (RECONCILER, settings.reconciler_token_sha256),
         )
         if sha256 is not None
     }
@@ -194,6 +201,8 @@ def identity_resolver(operator_group: str, static: StaticTokens | None) -> Calla
                 return _session_identity()
             if name == NIGHTLY:
                 return Identity(Caller(Tier.PROCESS, NIGHTLY_IDENTITY), operator_typed=False)
+            if name == RECONCILER:
+                return Identity(Caller(Tier.PROCESS, RECONCILER_IDENTITY), operator_typed=False)
         claims = token.claims or {}
         groups = claims.get("groups")
         if not isinstance(groups, list) or operator_group not in groups:

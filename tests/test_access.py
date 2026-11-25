@@ -6,6 +6,7 @@ The store is not trusted here: these tests show what Postgres itself lets each t
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
@@ -31,6 +32,7 @@ from factory_board.store import Caller
 
 TIERS = [OPERATOR, SESSION, RECONCILER]
 CLOSE = "UPDATE items SET closed_at = now(), resolution = 'done' WHERE id = %s"
+CLOSE_AS = "UPDATE items SET closed_at = now(), resolution = %s WHERE id = %s"
 
 
 @pytest.fixture
@@ -137,7 +139,9 @@ def test_every_tier_reads_every_item(app_url: str, held: dict[str, str], caller:
         (RECONCILER, "process:nightly", False),
         (RECONCILER, "human:operator", False),
         (RECONCILER, "session:0a1b2c3d", False),
-        (RECONCILER, "nobody", False),
+        # The reconciler closes a stage item nobody holds; no other process does.
+        (RECONCILER, "nobody", True),
+        (NIGHTLY, "nobody", False),
         (NIGHTLY, "process:nightly", True),
         (NIGHTLY, "process:reconciler", False),
     ],
@@ -657,13 +661,148 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
         "ORDER BY proname"
     ).fetchall()
     # The other one is a trigger's function, which nobody can call (the cascade, below).
-    assert definers == [("items_cascade_close",), ("set_pr_head_sha",)]
+    assert definers == [
+        ("items_cascade_close",),
+        ("merge_assess_trigger",),
+        ("set_pr_head_sha",),
+    ]
+
+
+# The second trigger on an open assess item
+
+MERGE = "SELECT merge_assess_trigger(%s, %s::timestamptz, %s::text[])"
+SOONER = datetime(2030, 1, 1, tzinfo=UTC)
+LATER = datetime(2030, 6, 1, tzinfo=UTC)
+
+
+@pytest.fixture
+def assess_item(owner: psycopg.Connection) -> str:
+    """An open `assess` item nobody holds, with a date and one reason."""
+    insert_stage_row(
+        owner, "aaaaaaaa", assignee="assess", subject_ref="301", not_before=LATER, reasons=["new"]
+    )
+    return "aaaaaaaa"
+
+
+def test_the_reconciler_merges_a_trigger_into_an_open_assess_item(
+    app_url: str, owner: psycopg.Connection, assess_item: str
+) -> None:
+    before = row_of(owner, assess_item)
+    with as_tier(app_url, RECONCILER) as conn:
+        # The direct way is closed to its tier: the columns are not granted.
+        with pytest.raises(errors.InsufficientPrivilege), conn.transaction():
+            conn.execute("UPDATE items SET reasons = '{changed}' WHERE id = %s", (assess_item,))
+        merged = conn.execute(MERGE, (assess_item, SOONER, ["changed", "new", "changed"]))
+        assert merged.fetchone() == (True,)
+    assert changes(owner, before, row_of(owner, assess_item)) == {
+        "not_before": (LATER, SOONER),
+        "reasons": (["new"], ["new", "changed"]),
+    }
+    # A later date does not move it, and no date is the earliest.
+    with as_tier(app_url, RECONCILER) as conn:
+        assert conn.execute(MERGE, (assess_item, LATER, [])).fetchone() == (True,)
+    assert changes(owner, before, row_of(owner, assess_item))["not_before"] == (LATER, SOONER)
+    with as_tier(app_url, RECONCILER) as conn:
+        assert conn.execute(MERGE, (assess_item, None, ["dated"])).fetchone() == (True,)
+    assert changes(owner, before, row_of(owner, assess_item)) == {
+        "not_before": (LATER, None),
+        "reasons": (["new"], ["new", "changed", "dated"]),
+    }
+
+
+@pytest.mark.parametrize("caller", [NIGHTLY, SESSION, RUN, OPERATOR], ids=lambda c: c.identity)
+def test_the_trigger_merge_is_the_reconciler_s_alone(
+    app_url: str, owner: psycopg.Connection, assess_item: str, caller: Caller
+) -> None:
+    """The nightly shares the reconciler's tier and may call the function, which refuses it
+    by name; the other tiers have no grant on it."""
+    before = row_of(owner, assess_item)
+    with pytest.raises(errors.InsufficientPrivilege) as refused, as_tier(app_url, caller) as conn:
+        conn.execute(MERGE, (assess_item, SOONER, ["changed"]))
+    by_name = "only the reconciler merges a trigger" in str(refused.value)
+    assert by_name is (caller is NIGHTLY)
+    assert row_of(owner, assess_item) == before
+
+
+@pytest.mark.parametrize("actor", [None, "", "process:reconcile", "process:reconciler "])
+def test_the_trigger_merge_needs_the_reconciler_as_the_actor(
+    app_url: str, owner: psycopg.Connection, assess_item: str, actor: str | None
+) -> None:
+    before = row_of(owner, assess_item)
+    with (
+        pytest.raises(errors.InsufficientPrivilege, match="only the reconciler"),
+        psycopg.connect(app_url) as conn,
+        conn.transaction(),
+    ):
+        conn.execute("SET LOCAL ROLE board_process")
+        if actor is not None:
+            conn.execute("SELECT set_config('board.actor', %s, true)", (actor,))
+        conn.execute(MERGE, (assess_item, SOONER, ["changed"]))
+    assert row_of(owner, assess_item) == before
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    [
+        None,
+        [None],
+        ["changed", None],
+        [""],
+        ["Changed"],
+        ["has space"],
+        ["-changed"],
+        ["changed\n"],
+        ["x" * 41],
+        ["changed"] * 21,
+    ],
+    ids=repr,
+)
+def test_the_trigger_merge_refuses_a_bad_or_null_reason(
+    app_url: str, owner: psycopg.Connection, assess_item: str, reasons: list[str | None] | None
+) -> None:
+    before = row_of(owner, assess_item)
+    with pytest.raises(errors.CheckViolation), as_tier(app_url, RECONCILER) as conn:
+        conn.execute(MERGE, (assess_item, SOONER, reasons))
+    assert row_of(owner, assess_item) == before
+
+
+def test_the_trigger_merge_touches_an_open_unheld_assess_item_only(
+    app_url: str, owner: psycopg.Connection, held: dict[str, str], assess_item: str
+) -> None:
+    """A closed item, an item that is not an `assess` item, an item a run holds and an ID
+    that is no item: each returns false and changes nothing."""
+    insert_stage_row(owner, "cccccccc", assignee="assess", subject_ref="302", reasons=["new"])
+    owner.execute(CLOSE_AS, ("superseded", "cccccccc"))
+    insert_stage_row(
+        owner, "dddddddd", assignee="assess", subject_ref="303", claimed_by=RUN.identity
+    )
+    unchanged = {i: row_of(owner, i) for i in [*held.values(), "cccccccc", "dddddddd"]}
+    with as_tier(app_url, RECONCILER) as conn:
+        for item_id in [*unchanged, "zzzzzzzz"]:
+            assert conn.execute(MERGE, (item_id, SOONER, ["changed"])).fetchone() == (False,)
+        # The open, unheld one beside them still takes it.
+        assert conn.execute(MERGE, (assess_item, SOONER, ["changed"])).fetchone() == (True,)
+    assert {item_id: row_of(owner, item_id) for item_id in unchanged} == unchanged
+
+
+def test_the_trigger_merge_is_the_owner_s_and_for_processes_only(
+    owner: psycopg.Connection,
+) -> None:
+    row = owner.execute(
+        "SELECT prosecdef, proconfig, pg_get_userbyid(proowner), proacl::text "
+        "FROM pg_proc WHERE proname = 'merge_assess_trigger'"
+    ).fetchone()
+    assert row is not None
+    security_definer, config, function_owner, acl = row
+    assert security_definer is True
+    assert config == ["search_path=pg_catalog, pg_temp"]
+    assert function_owner == "board_owner"
+    assert acl == "{board_owner=X/board_owner,board_process=X/board_owner}"
 
 
 # Waiting, the cascade and the edges
 
 EDGE = "INSERT INTO item_after (item_id, after_id) VALUES (%s, %s)"
-CLOSE_AS = "UPDATE items SET closed_at = now(), resolution = %s WHERE id = %s"
 
 
 def own(caller: Caller) -> str:
@@ -714,6 +853,9 @@ def test_a_failure_closes_what_waits_on_it_whoever_holds_that(
     bystander = row_of(owner, held["process:nightly"])
     with as_tier(app_url, caller) as conn:
         for other in (second, third):
+            if caller is RECONCILER and other == third:
+                # The reconciler may close an unheld stage item itself; the cascade still does.
+                continue
             assert conn.execute(CLOSE_AS, ("superseded", other)).rowcount == 0
         assert conn.execute(CLOSE_AS, (resolution, item_id)).rowcount == 1
     rows = owner.execute(

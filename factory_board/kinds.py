@@ -3,8 +3,11 @@
 An operator item is one model per kind, picked by its `kind` field. A typed kind renders
 its command from checked fields, so nothing a writer sends reaches a command line unchecked.
 `manual` (a command) and `session` (a prompt) carry the writer's own text, which nothing
-checks, and their rendering says so. The stage kinds are names only here; their models come
-with the stages.
+checks, and their rendering says so.
+
+A stage item is one model per kind too, for the kinds the reconciler writes: `assess`,
+`review`, `merge`, `deploy-check` and a continuing `work` item. The others come with the
+steps that write them.
 
 Pure Python: no database, no MCP.
 """
@@ -45,7 +48,7 @@ class OperatorKind(StrEnum):
 
 
 class StageKind(StrEnum):
-    """Kinds for the stages and the merge script. Names only: no models yet."""
+    """Kinds for the stages and the merge script."""
 
     ASSESS = "assess"
     WORK = "work"
@@ -100,6 +103,34 @@ class Workload(StrEnum):
     DEPLOYMENT = "deployment"
     STATEFULSET = "statefulset"
     DAEMONSET = "daemonset"
+
+
+class AssessReason(StrEnum):
+    """Why an issue is to be assessed. An open `assess` item collects them."""
+
+    NEW = "new"
+    CHANGED = "changed"
+    REOPENED = "reopened"
+    CLOSED_ELSEWHERE = "closed-elsewhere"
+    OPERATOR_ITEMS_CLOSED = "operator-items-closed"
+    DEPLOY_CHECKS_CLOSED = "deploy-checks-closed"
+    DATED = "dated"
+    ALERT = "alert"
+
+
+class ContinuationCause(StrEnum):
+    """The fact on an open PR that sends it back to work."""
+
+    CONFLICT = "conflict"
+    FAILED_CHECK = "failed-check"
+    REVIEW_BLOCK = "review-block"
+
+
+class NoDeployCheck(StrEnum):
+    """Why a merged PR's deploy check is written already closed: no session looks."""
+
+    NOTHING_TO_DEPLOY = "nothing-to-deploy"
+    DEPLOYS_THROUGH_HOMELAB = "deploys-through-homelab"
 
 
 OPERATOR_KINDS: tuple[str, ...] = tuple(kind.value for kind in OperatorKind)
@@ -527,6 +558,63 @@ OperatorItem = Annotated[
 
 _OPERATOR_ITEM: TypeAdapter[OperatorItem] = TypeAdapter(OperatorItem)
 
+# --- Stage kinds -----------------------------------------------------------------------
+# A stage item carries its inputs and no command: nothing here is rendered for the operator.
+
+
+class Assess(_Model):
+    kind: Literal["assess"] = "assess"
+    issue: Ticket
+    # On a dated item: what to check once the date is reached.
+    note: Prose | None = None
+
+    @property
+    def subject(self) -> Subject:
+        return Subject(repo=self.issue.repo, type=SubjectType.ISSUE, ref=self.issue.number)
+
+
+class _PullRequestStageItem(_Model):
+    repo: Repo
+    number: Number
+
+    @property
+    def subject(self) -> Subject:
+        return Subject(repo=self.repo, type=SubjectType.PR, ref=self.number)
+
+
+class Review(_PullRequestStageItem):
+    kind: Literal["review"] = "review"
+    # The commit to review. A push after it voids the verdict.
+    head_sha: HeadSha
+
+
+class Merge(_PullRequestStageItem):
+    kind: Literal["merge"] = "merge"
+    # The commit the verdict and the checks are on; the merge script merges this one only.
+    head_sha: HeadSha
+
+
+class DeployCheck(_PullRequestStageItem):
+    kind: Literal["deploy-check"] = "deploy-check"
+    merge_sha: HeadSha
+
+
+class Work(_PullRequestStageItem):
+    """A continuation item: work goes on, on the same branch and PR. The `work` item that
+    assess writes for an issue comes with the stages."""
+
+    kind: Literal["work"] = "work"
+    head_sha: HeadSha
+    cause: ContinuationCause
+
+
+StageItem = Annotated[
+    Assess | Review | Merge | DeployCheck | Work,
+    Field(discriminator="kind"),
+]
+
+_STAGE_ITEM: TypeAdapter[StageItem] = TypeAdapter(StageItem)
+
 
 def parse_operator_item(data: object) -> OperatorItem:
     """Validate an operator item, picking the model from its `kind`.
@@ -534,3 +622,11 @@ def parse_operator_item(data: object) -> OperatorItem:
     Raises pydantic.ValidationError when the kind is unknown or a field is refused.
     """
     return _OPERATOR_ITEM.validate_python(data)
+
+
+def parse_stage_item(data: object) -> StageItem:
+    """Validate a stage item, picking the model from its `kind`.
+
+    Raises pydantic.ValidationError when the kind has no model or a field is refused.
+    """
+    return _STAGE_ITEM.validate_python(data)

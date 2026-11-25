@@ -116,6 +116,7 @@ The tier belongs to the token (`factory_board/auth.py`), and is checked on every
 | The operator, in claude.ai | A Pocket ID login in the operator group, through FastMCP's `OIDCProxy` | `human:<username>` | `board_operator` |
 | An interactive session | The session token, with the session's ID in the `X-Factory-Board-Session` header | `session:<id>` | `board_agent` |
 | The nightly | The nightly token | `process:nightly` | `board_process` |
+| The reconciler | The reconciler token | `process:reconciler` | `board_process` |
 
 - A static token is accepted only when the route header is exactly `private`. The private
   route must set that header and the public route must set it to `public`; a route that
@@ -134,6 +135,22 @@ port of their own. A tool outside the caller's row is refused.
 | Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump` |
 | Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
+| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `get_item`, `list_pipeline_items`, `list_assessments` |
+
+The operator and a session also have `list_pipeline_items` and `list_assessments`: the
+pipeline's queue can be read by every caller but the nightly. The two processes share a tier
+and are told apart by identity.
+
+- `write_stage_item` writes an `assess`, `review`, `merge`, `deploy-check` or continuing
+  `work` item, held by nobody. One is open per stage and subject. A second `assess` trigger
+  merges into the open item unless a run holds it (`merge_assess_trigger`,
+  `migrations/0007_reconciler.sql`): the earlier `not_before` wins and new reasons are
+  appended. A `deploy-check` with `closed_as` is written closed, as a record.
+- `write_operator_item` writes any operator kind. The reconciler holds a `pr-approve` or
+  `pr-merge` item it writes; the operator holds the rest.
+- `close_for_fact` closes a PR item the reconciler holds (done or superseded) or a stage
+  item nobody holds (superseded only), with `{"cause": <name>}` as the result. The policy
+  `items_update_reconciler` allows the second for `process:reconciler` alone.
 
 - `done`, `answer` and `defer` work on an item a person holds. `reply` closes such an item
   as replied; on an item someone else holds it attaches the reply and leaves it open.
@@ -172,6 +189,7 @@ port of their own. A tool outside the caller's row is refused.
 | `FACTORY_BOARD_PORT`, `FACTORY_BOARD_METRICS_PORT` | The MCP's port (8000) and the metrics' (9090) |
 | `FACTORY_BOARD_SESSION_TOKEN_SHA256` | The SHA-256 of the interactive sessions' token. Unset, that token is off |
 | `FACTORY_BOARD_NIGHTLY_TOKEN_SHA256` | The SHA-256 of the nightly's token. Unset, that token is off |
+| `FACTORY_BOARD_RECONCILER_TOKEN_SHA256` | The SHA-256 of the reconciler's token. Unset, that token is off. The three hashes must differ |
 
 `python -m factory_board migrate` applies the pending migrations and exits. A command asks
 only for the URL it needs, and fails by name when that one is missing.

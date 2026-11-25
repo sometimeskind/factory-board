@@ -388,8 +388,17 @@ class Store:
             raise await self._refusal(conn, item_id)
         return _item(row)
 
-    async def create_item(self, caller: Caller, new: NewItem) -> Created:
+    async def create_item(
+        self,
+        caller: Caller,
+        new: NewItem,
+        *,
+        close_as: tuple[Resolution, dict[str, Any]] | None = None,
+    ) -> Created:
         """Insert an item, or return the open item that already stands in its place.
+
+        With `close_as` a new item is closed in the transaction that writes it, for a fact
+        that needs a record and no work. An item that was already open is left open.
 
         The existing item is returned as it is, with one exception: a new head SHA on a
         PR item is written to the existing item, since that is what a second push means
@@ -443,6 +452,17 @@ class Store:
                 row = await cur.fetchone()
                 if row is not None:
                     await self._add_after(conn, row["id"], new.after)
+                    if close_as is not None:
+                        item = await self._update_open(
+                            conn,
+                            row["id"],
+                            sql.SQL(
+                                "closed_at = now(), resolution = %(resolution)s, "
+                                "result = %(result)s"
+                            ),
+                            {"resolution": close_as[0].value, "result": Jsonb(close_as[1])},
+                        )
+                        return Created(item, existing=False)
                     item = await self._fetch(conn, row["id"])
                     assert item is not None
                     return Created(item, existing=False)
@@ -552,6 +572,71 @@ class Store:
                 """
                 ).format(_ITEM),
                 {"assignee": assignee, "include_deferred": include_deferred},
+            )
+            return [_item(row) for row in await cur.fetchall()]
+
+    async def merge_assess_trigger(
+        self, caller: Caller, item_id: str, not_before: datetime | None, reasons: tuple[str, ...]
+    ) -> Item:
+        """Merge a new trigger into an open `assess` item: the earlier date wins, and no
+        date is the earliest; the reasons it does not have yet are appended.
+
+        The reconciler only. An item a run holds is returned as it is: a trigger while a
+        run is on the issue does nothing.
+        """
+        async with self._as(caller) as conn:
+            await conn.execute(
+                "SELECT merge_assess_trigger(%s, %s, %s)", (item_id, not_before, list(reasons))
+            )
+            item = await self._fetch(conn, item_id)
+        if item is None:
+            raise ItemNotFound(f"no item {item_id}")
+        return item
+
+    async def list_pipeline(
+        self, caller: Caller, *, repo: str | None = None, closed_since: datetime | None = None
+    ) -> list[Item]:
+        """The pipeline's items, oldest first: every stage's, every pr-approve and pr-merge
+        item, and the operator's items the caller wrote itself.
+
+        The open ones, deferred ones included, and with `closed_since` also the ones closed
+        from that time on. `repo` leaves out other repos' items, and those with no repo.
+        """
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    """
+                SELECT {} FROM items
+                WHERE (
+                        assignee <> 'operator'
+                        OR kind IN ('pr-approve', 'pr-merge')
+                        OR created_by = current_setting('board.actor', true)
+                      )
+                  AND (closed_at IS NULL OR closed_at >= %(closed_since)s::timestamptz)
+                  AND (%(repo)s::text IS NULL OR subject_repo = %(repo)s::text)
+                ORDER BY created_at, id
+                """
+                ).format(_ITEM),
+                {"repo": repo, "closed_since": closed_since},
+            )
+            return [_item(row) for row in await cur.fetchall()]
+
+    async def last_assessments(self, caller: Caller, repo: str) -> list[Item]:
+        """For each issue of the repo that was ever assessed: its last closed `assess` item."""
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    """
+                SELECT * FROM (
+                    SELECT DISTINCT ON (subject_ref) {} FROM items
+                    WHERE kind = 'assess' AND closed_at IS NOT NULL
+                      AND subject_type = 'issue' AND subject_repo = %(repo)s
+                    ORDER BY subject_ref, closed_at DESC, id
+                ) AS last
+                ORDER BY subject_ref::bigint
+                """
+                ).format(_ITEM),
+                {"repo": repo},
             )
             return [_item(row) for row in await cur.fetchall()]
 

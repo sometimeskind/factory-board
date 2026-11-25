@@ -25,21 +25,27 @@ from starlette.responses import PlainTextResponse
 from factory_board import metrics
 from factory_board.auth import Identity
 from factory_board.kinds import (
+    Assess,
+    AssessReason,
     Decision,
+    DeployCheck,
     HeadSha,
     Identifier,
+    NoDeployCheck,
     Number,
     OperatorItem,
     PrApprove,
     PrMerge,
     Rendered,
     Repo,
+    StageItem,
     SubjectType,
     parse_operator_item,
 )
 from factory_board.kinds import Subject as KindSubject
 from factory_board.store import (
     MAX_AFTER,
+    Created,
     Item,
     NewItem,
     Reply,
@@ -67,7 +73,9 @@ The tier belongs to the token. The operator lists items and uses the verbs: done
 command was run), answer (a decision), reply (free text), defer (hide until a date), reject
 ("not doing this", with a reason) and bump (make it urgent). A session creates items for the
 operator and reads them. The nightly creates keyed items, reads the replies on its own and
-closes its own. A tool outside the caller's tier is refused.
+closes its own. The reconciler writes the items that follow from what GitHub shows, for the
+pipeline's stages and for the operator, and closes them when the fact goes away. A tool
+outside the caller's tier is refused.
 
 Every verb takes the item's ID, never a position in a list, and answers with a confirmation
 that repeats the item's subject and command: show it to the operator. A closed item stays
@@ -102,10 +110,24 @@ After = Annotated[
     ),
 ]
 
-OPERATOR = frozenset({Tier.OPERATOR})
-SESSION = frozenset({Tier.AGENT})
-READERS = frozenset({Tier.OPERATOR, Tier.AGENT})
-NIGHTLY = frozenset({Tier.PROCESS})
+# Who may call a tool. The two processes share a tier and are told apart by name.
+OPERATOR = frozenset({"operator"})
+SESSION = frozenset({"session"})
+NIGHTLY = frozenset({"nightly"})
+RECONCILER = frozenset({"reconciler"})
+READERS = OPERATOR | SESSION
+EVERY_READER = READERS | RECONCILER
+
+
+def who(identity: Identity) -> str:
+    """The caller's row in the tool table: `operator`, `session`, or a process's name."""
+    caller = identity.caller
+    if caller.tier is Tier.OPERATOR:
+        return "operator"
+    if caller.tier is Tier.AGENT:
+        return "session"
+    return caller.identity.partition(":")[2]
+
 
 NOT_WOKEN = (
     "Nothing is woken by this yet: until the pipeline's stages run, tell the session that "
@@ -164,7 +186,14 @@ def view(item: Item, replies: list[Reply] | None = None) -> dict[str, Any]:
         "open": item.is_open,
     }
     shown = _rendered(item)
-    if shown is not None:
+    if shown is None:
+        # A stage's item: its inputs, and why an assess item was written.
+        out["fields"] = item.fields
+        if item.reasons:
+            out["reasons"] = list(item.reasons)
+        if item.input_hash is not None:
+            out["input_hash"] = item.input_hash
+    else:
         parsed, rendered = shown
         out |= {
             "summary": parsed.summary,
@@ -249,11 +278,11 @@ def build_server(
     operator_identity = f"human:{operator}"
 
     async def call[T](
-        tool: str, tiers: frozenset[Tier], fn: Callable[[Identity], Awaitable[T]]
+        tool: str, callers: frozenset[str], fn: Callable[[Identity], Awaitable[T]]
     ) -> T:
         try:
             identity = current_identity()
-            if identity.caller.tier not in tiers:
+            if who(identity) not in callers:
                 raise ToolError(f"{tool} is not a tool of this caller's tier")
             result = await fn(identity)
         except ToolError:
@@ -350,7 +379,38 @@ def build_server(
             item = await store.get_item(identity.caller, item_id)
             return view(item, await store.list_replies(identity.caller, item_id))
 
-        return await call("get_item", READERS, run)
+        return await call("get_item", EVERY_READER, run)
+
+    async def list_pipeline_items(
+        repo: Annotated[
+            Repo | None, Field(description="only this repo's items; none for every repo")
+        ] = None,
+        closed_since: Annotated[
+            datetime | None,
+            Field(description="also the items closed from this time on, with its UTC offset"),
+        ] = None,
+    ) -> dict[str, Any]:
+        """The pipeline's queue, oldest first: every stage's open items (assess, work, review,
+        merge, deploy-check), deferred ones included, every open pr-approve and pr-merge item,
+        and the operator's open items the caller wrote itself."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            if closed_since is not None and closed_since.tzinfo is None:
+                raise ToolError("closed_since needs a UTC offset, e.g. 2026-01-31T08:00:00+00:00")
+            items = await store.list_pipeline(identity.caller, repo=repo, closed_since=closed_since)
+            return {"items": [view(item) for item in items]}
+
+        return await call("list_pipeline_items", EVERY_READER, run)
+
+    async def list_assessments(repo: Repo) -> dict[str, Any]:
+        """For each issue of a repo that was ever assessed: its last closed assess item, with
+        the staleness hash it was assessed under and its result."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            items = await store.last_assessments(identity.caller, repo)
+            return {"items": [view(item) for item in items]}
+
+        return await call("list_assessments", EVERY_READER, run)
 
     # ---- the operator's verbs ----
 
@@ -573,6 +633,133 @@ def build_server(
 
         return await call("close_own_item", NIGHTLY, run)
 
+    # ---- the reconciler ----
+
+    def answer_for(verb: str, identity: Identity, created: Created) -> dict[str, Any]:
+        if not created.existing:
+            record(verb, created.item, identity)
+        return {
+            "status": "already open" if created.existing else "created",
+            "confirmation": _confirmation(created.item),
+            "item": view(created.item),
+        }
+
+    async def write_stage_item(
+        item: StageItem,
+        not_before: Annotated[
+            datetime | None,
+            Field(description="the item is in no queue before this time; with its UTC offset"),
+        ] = None,
+        reasons: Annotated[
+            list[AssessReason],
+            Field(max_length=8, description="for an assess item: why the issue is to be assessed"),
+        ] = [],  # noqa: B006
+        urgent: bool = False,
+        closed_as: Annotated[
+            NoDeployCheck | None,
+            Field(description="for a deploy-check that needs no session: written already closed"),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Write an item for a stage, from a fact GitHub shows. Nobody holds it until a run
+        claims it. At most one item is open per stage and subject: a second write returns the
+        open one. For an assess item it also merges into the open one, unless a run holds it:
+        the earlier not_before wins (none is the earliest) and new reasons are appended.
+
+        A deploy-check with closed_as is a record only: it is written closed, and a second
+        write makes a second record, so look for the first with list_pipeline_items."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            if not_before is not None and not_before.tzinfo is None:
+                raise ToolError("not_before needs a UTC offset, e.g. 2026-01-31T08:00:00+00:00")
+            if reasons and not isinstance(item, Assess):
+                raise ToolError("reasons are for an assess item")
+            if closed_as is not None and not isinstance(item, DeployCheck):
+                raise ToolError("closed_as is for a deploy-check item")
+            if len(set(reasons)) != len(reasons):
+                raise ToolError("a reason is named twice")
+            subject = item.subject
+            names = tuple(reason.value for reason in reasons)
+            created = await store.create_item(
+                identity.caller,
+                NewItem(
+                    assignee=item.kind,
+                    kind=item.kind,
+                    subject=Subject(subject.type.value, str(subject.ref), subject.repo),
+                    fields=item.model_dump(mode="json"),
+                    not_before=not_before,
+                    urgent=urgent,
+                    reasons=names,
+                ),
+                close_as=None
+                if closed_as is None
+                else (Resolution.DONE, {"outcome": closed_as.value}),
+            )
+            if created.existing and isinstance(item, Assess):
+                merged = await store.merge_assess_trigger(
+                    identity.caller, created.item.id, not_before, names
+                )
+                if merged != created.item:
+                    record("merge", merged, identity)
+                created = Created(merged, existing=True)
+            return answer_for("create", identity, created)
+
+        return await call("write_stage_item", RECONCILER, run)
+
+    async def write_operator_item(
+        item: OperatorItem,
+        after: After = [],  # noqa: B006
+        holds: bool = True,
+    ) -> dict[str, Any]:
+        """Write an item for the operator, from a fact GitHub shows. The reconciler holds a
+        pr-approve or pr-merge item and closes it when GitHub shows the approval or the merge;
+        the operator holds every other kind. One PR item is open per PR: a second write
+        returns it, with its head SHA moved if the new one differs."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            holder = (
+                identity.caller.identity
+                if isinstance(item, PrApprove | PrMerge)
+                else operator_identity
+            )
+            return await create("create", identity, item, None, holder, after, holds)
+
+        return await call("write_operator_item", RECONCILER, run)
+
+    write_operator_item.__doc__ = f"{write_operator_item.__doc__}\n\n{CONTENT_RULE}"
+
+    async def close_for_fact(
+        item_id: ItemId,
+        cause: Annotated[
+            Identifier,
+            Field(description="the fact, as a short name: approved, merged, head-moved"),
+        ],
+        superseded: Annotated[
+            bool,
+            Field(description="true when the fact went away; false when it came about"),
+        ] = True,
+    ) -> dict[str, Any]:
+        """Close an item because of what GitHub shows: a PR item the reconciler holds, as done
+        (the approval or the merge is there) or as superseded (the head moved, the PR closed);
+        or a stage's item that no run holds, as superseded only."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            item = await store.get_item(identity.caller, item_id)
+            if item.assignee != "operator" and not superseded:
+                raise ToolError("a stage's item is closed as done by its run only")
+            closed = await store.close_item(
+                identity.caller,
+                item_id,
+                Resolution.SUPERSEDED if superseded else Resolution.DONE,
+                {"cause": cause},
+            )
+            record("close", closed, identity)
+            return {
+                "status": "superseded" if superseded else "done",
+                "confirmation": _confirmation(closed),
+            }
+
+        return await call("close_for_fact", RECONCILER, run)
+
     read_only = {"readOnlyHint": True}
     write = {"destructiveHint": False}
     final = {"destructiveHint": True}
@@ -580,6 +767,11 @@ def build_server(
         (list_items, read_only),
         (get_item, read_only),
         (list_own_items, read_only),
+        (list_pipeline_items, read_only),
+        (list_assessments, read_only),
+        (write_stage_item, write),
+        (write_operator_item, write),
+        (close_for_fact, final),
         (done, final),
         (answer, final),
         (reply, final),
