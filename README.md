@@ -72,7 +72,8 @@ What each tier may do with a row (`migrations/0003_access.sql`):
   delete one. See [Waiting](#waiting).
 - `holds` is written with the item and never changed. It says whether an operator's item
   holds its issue (the issue waits on the operator because of it), and may be false only on
-  an operator's item about an issue (a CHECK). Nothing reads it yet.
+  an operator's item about an issue (a CHECK). An item that does not hold wakes nothing
+  when it closes ([What the board does by itself](#what-the-board-does-by-itself)).
 - Postgres refuses an `UPDATE` under these policies silently: no row changes and nothing is
   raised. The store checks the row count and raises `NotClaimHolder`, `ItemClosed` or
   `ItemNotFound`.
@@ -136,7 +137,7 @@ port of their own. A tool outside the caller's row is refused.
 | Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump` |
 | Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
-| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `get_item`, `list_pipeline_items`, `list_assessments` |
+| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `get_item`, `list_pipeline_items`, `list_assessments` |
 | Dispatcher | `list_claimable`, `claim`, `release`, `get_item`, `list_pipeline_items`, `list_assessments` |
 
 The operator and a session also have `list_pipeline_items` and `list_assessments`: the
@@ -147,12 +148,15 @@ tier and are told apart by identity.
   `work` item, held by nobody. One is open per stage and subject. A second `assess` trigger
   merges into the open item unless a run holds it (`merge_assess_trigger`,
   `migrations/0007_reconciler.sql`): the earlier `not_before` wins and new reasons are
-  appended. A `deploy-check` with `closed_as` is written closed, as a record.
+  appended. A `deploy-check` lists the issues its merged PR references (`issues`, at most
+  10), and with `closed_as` it is written closed, as a record.
 - `write_operator_item` writes any operator kind. The reconciler holds a `pr-approve` or
   `pr-merge` item it writes; the operator holds the rest.
 - `close_for_fact` closes a PR item the reconciler holds (done or superseded) or a stage
   item nobody holds (superseded only), with `{"cause": <name>}` as the result. The policy
   `items_update_reconciler` allows the second for `process:reconciler` alone.
+- `heartbeat` records that a pass finished, at the database's time (`record_heartbeat`,
+  for `process:reconciler` alone). The metrics export it.
 
 ### Claims
 
@@ -189,6 +193,65 @@ check the caller; no tier may write the claim columns or the counters.
 - `get_item` shows a stage item's `claims`: each run, when it claimed, and how the claim
   ended (`closed`, `released` with its reason, `expired`).
 
+### What the board does by itself
+
+Three rules live in triggers (`migrations/0009_board_triggers.sql`) and act in the
+transaction that makes their fact true. No tier can call or switch them off.
+
+**Waking assess.** The board writes an issue's `assess` item, or merges into the open one:
+the item is due now, and the reason is appended. The item is ordinary, held by nobody and
+created by `process:board`.
+
+| The fact | Reason | Detail |
+|---|---|---|
+| The operator's last open item that holds an issue closed | `operator-items-closed` | The item is about the issue and `holds`. However it closed (done, answered, replied, rejected, superseded, or down a reject's chain) and whoever closed it. A deferred or a waiting item is still open |
+| A `pr-approve` or `pr-merge` item closed as rejected or replied | `operator-items-closed` | For the issue in its `ticket`, and only when no item of the operator's holds that issue. Closed as done or superseded it wakes nothing: the PR goes on by itself |
+| The last open `deploy-check` that names an issue closed | `deploy-checks-closed` | For each issue in its `issues`, however it closed, also when it was written closed, and whatever the operator has open |
+
+- An item with `holds` false wakes nothing and keeps nothing waiting.
+- The decision written after two expired claims wakes nothing when it is answered with
+  "try again", and nothing when its item is the issue's own `assess` item.
+- A reject of a stage's item other than a `deploy-check` wakes nothing, and neither does a
+  reply that leaves its item open.
+- Two closes at the same moment take one advisory lock, so one of them sees the other's.
+
+**A wake while a run holds the issue's `assess` item** is kept, not dropped: the staleness
+hash covers the issue's text and not the board's items, so nothing else would notice it.
+
+- The reason is recorded on the held item, in `pending_reasons`, once each. What the run
+  was started on (`reasons`, `not_before`) does not change. No tier can write the column;
+  `get_item` shows it.
+- When the held item closes with reasons pending, however it closed, the board writes the
+  issue's next `assess` item in that transaction, due now and with those reasons, and
+  clears the record.
+- When the item goes back to the queue instead (its claim is released or runs out), the
+  pending reasons move into its `reasons`.
+- An item that waits on the decision after two expired claims is held by no run, so a wake
+  merges into it as into any open item, and goes with it if the operator stops it.
+- The reconciler's own trigger on a held item is still dropped (`merge_assess_trigger`):
+  its facts are on GitHub, where the next pass reads them again.
+- The reasons are `new`, `changed`, `reopened`, `closed-elsewhere`, `dated`, `alert` and
+  `orphaned` (an open issue with no open item of any kind, found by the reconciler's
+  sweep) from the reconciler, and the board's two.
+
+**The operator acted.** `operator_acts` keeps, per issue, when the operator last acted on
+it: any change a `human:` caller makes to an item of the issue (done, answer, reject, a
+closing reply, defer, bump), a reply on one, and a `pr-approve` item that closes as done
+(the reconciler closes it on the operator's approval). An item's issue is its subject, the
+`ticket` of an operator's item about something else, or a `deploy-check`'s `issues`. Every
+tier reads the table and none writes it.
+
+**The fix-forward limit.** The board refuses a fourth `work` item that a run writes for an
+issue since the operator last acted on it (SQLSTATE `BRD04`; the store raises
+`FixForwardLimit`). The view `fix_forward` has the count per issue.
+
+- Counted: a `work` item about the issue, created by a `run:` identity, however it closed.
+- Not counted: a continuation item (about its PR, written by the reconciler) and a
+  session's `work` item.
+- Writing the `work` item that is still open again is not a fourth: the open one stands.
+- No run can write an item over HTTP yet, so today the rule is reachable in the database
+  and through the store only.
+
 - `done`, `answer` and `defer` work on an item a person holds. `reply` closes such an item
   as replied; on an item someone else holds it attaches the reply and leaves it open.
   `reject` and `bump` work on any open item.
@@ -205,6 +268,21 @@ check the caller; no tier may write the claim columns or the counters.
   `factory_board_issue_open_items` (by repo and issue: the operator's open items that hold
   that issue, deferred and waiting ones included; an issue with none has no series) and
   `factory_board_tool_calls_total`.
+- The queue's metrics, from the same reading:
+  - `factory_board_claimable_items` (by stage, urgent): what a run may be started on now,
+    as the `claimable` view has it. Every stage of the order has both series, at 0 when
+    its queue is empty; `merge` items are not in it.
+  - `factory_board_oldest_claimable_item_timestamp_seconds` (by stage, urgent): since when
+    the item longest in that queue could have been claimed, which is the latest of its
+    creation, its `not_before`, the end of its last claim and the close of the last item
+    it waited on. No series for an empty queue.
+  - `factory_board_claims` (by stage, ending, reason): claims, ever. `ending` is `closed`,
+    `released`, `expired`, or `running` for one that has not ended; `reason` is a
+    release's reason and empty otherwise.
+  - `factory_board_issues_at_fix_forward_limit`: issues a fourth `work` item would be
+    refused on.
+  - `factory_board_reconciler_pass_timestamp_seconds`: the reconciler's last `heartbeat`;
+    0 until the first one.
 
 ## Settings
 

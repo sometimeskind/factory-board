@@ -33,6 +33,37 @@ ISSUE_OPEN_ITEMS = Gauge(
     "The operator's open items that hold an issue",
     ["repo", "issue"],
 )
+# The queue the dispatcher reads: what a run may be started on now. Every stage of the order
+# has both series, at 0 when its queue is empty, so a rule never sees "no data".
+QUEUE_STAGES = ("health", "digest", "review", "deploy-check", "assess", "work", "retro")
+CLAIMABLE_ITEMS = Gauge(
+    "factory_board_claimable_items",
+    "Stage items a run may be started on now: open, unheld, not deferred, not waiting",
+    ["stage", "urgent"],
+)
+# Not the item's creation: a dated item, a released one and one that waited on another
+# entered the queue later. No series for an empty queue.
+OLDEST_CLAIMABLE_ITEM = Gauge(
+    "factory_board_oldest_claimable_item_timestamp_seconds",
+    "Since when the item longest in a stage's queue could have been claimed",
+    ["stage", "urgent"],
+)
+# `ending` is closed, released, expired, or running for a claim that has not ended;
+# `reason` is a release's reason and empty otherwise.
+CLAIMS = Gauge(
+    "factory_board_claims",
+    "Claims, ever, by the item's stage and how they ended",
+    ["stage", "ending", "reason"],
+)
+FIX_FORWARD_ISSUES = Gauge(
+    "factory_board_issues_at_fix_forward_limit",
+    "Issues with three work items from assess since the operator last acted on them",
+)
+# 0 until the reconciler's first heartbeat: a rule on its age leaves 0 out.
+RECONCILER_PASS = Gauge(
+    "factory_board_reconciler_pass_timestamp_seconds",
+    "When the reconciler last recorded a finished pass",
+)
 LAST_REFRESH = Gauge(
     "factory_board_metrics_refresh_timestamp_seconds",
     "When the item gauges were last read from the database",
@@ -62,4 +93,18 @@ def show(stats: Stats) -> None:
         CLOSED_ITEMS.labels(row.assignee, row.resolution).set(row.count)
     for row in stats.issues:
         ISSUE_OPEN_ITEMS.labels(row.repo, row.issue).set(row.count)
+    CLAIMABLE_ITEMS.clear()
+    OLDEST_CLAIMABLE_ITEM.clear()
+    CLAIMS.clear()
+    for stage in QUEUE_STAGES:
+        for urgent in ("false", "true"):
+            CLAIMABLE_ITEMS.labels(stage, urgent).set(0)
+    for row in stats.queue:
+        labels = (row.stage, str(row.urgent).lower())
+        CLAIMABLE_ITEMS.labels(*labels).set(row.count)
+        OLDEST_CLAIMABLE_ITEM.labels(*labels).set(row.oldest_since)
+    for row in stats.claims:
+        CLAIMS.labels(row.stage, row.ending, row.reason).set(row.count)
+    FIX_FORWARD_ISSUES.set(stats.at_fix_forward_limit)
+    RECONCILER_PASS.set(stats.reconciler_pass or 0)
     LAST_REFRESH.set_to_current_time()

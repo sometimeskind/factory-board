@@ -116,6 +116,8 @@ class AssessReason(StrEnum):
     DEPLOY_CHECKS_CLOSED = "deploy-checks-closed"
     DATED = "dated"
     ALERT = "alert"
+    # The reconciler's sweep: an open issue with no open item of any kind.
+    ORPHANED = "orphaned"
 
 
 class ContinuationCause(StrEnum):
@@ -616,6 +618,15 @@ class Merge(_PullRequestStageItem):
 class DeployCheck(_PullRequestStageItem):
     kind: Literal["deploy-check"] = "deploy-check"
     merge_sha: HeadSha
+    # The issues the merged PR references. When the last open deploy-check that names an
+    # issue closes, the board wakes assess for it; a check that names none wakes nothing.
+    issues: tuple[Ticket, ...] = Field(default=(), max_length=10)
+
+    @model_validator(mode="after")
+    def _issues_differ(self) -> Self:
+        if len(set(self.issues)) != len(self.issues):
+            raise ValueError("an issue is named twice")
+        return self
 
 
 class Work(_PullRequestStageItem):
