@@ -45,7 +45,7 @@ EVERY_TIER = [OPERATOR, SESSION, DISPATCHER]
 NOT_THE_DISPATCHER = [NIGHTLY, RECONCILER, SESSION, RUN, OPERATOR]
 
 CLAIM = "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)"
-RELEASE = "SELECT release_claim(%s, %s, %s)"
+RELEASE = "SELECT release_claim(%s, %s, %s, %s)"
 EXPIRE = "SELECT * FROM expire_claims(%s)"
 TOKEN = "SELECT * FROM run_of_token(%s)"
 CLOSE = "UPDATE items SET closed_at = now(), resolution = 'done' WHERE id = %s"
@@ -95,10 +95,17 @@ def claim(
 
 
 def release(
-    app_url: str, item_id: str, reason: str = "stopped", wake: Any = None, by: Caller = DISPATCHER
+    app_url: str,
+    item_id: str,
+    reason: str = "stopped",
+    wake: Any = None,
+    by: Caller = DISPATCHER,
+    holder: str | None = None,
 ) -> bool:
+    if holder is None and reason == "result-refused":
+        holder = OPERATOR.identity
     with as_tier(app_url, by) as conn:
-        row = conn.execute(RELEASE, (item_id, reason, wake)).fetchone()
+        row = conn.execute(RELEASE, (item_id, reason, wake, holder)).fetchone()
     assert row is not None
     return row[0]
 
@@ -190,7 +197,7 @@ def test_a_process_whose_actor_is_not_the_dispatcher_claims_nothing(
     for statement, arguments in (
         (CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "lisbon", "normal")),
         (EXPIRE, (OPERATOR.identity,)),
-        (RELEASE, (item, "stopped", None)),
+        (RELEASE, (item, "stopped", None, None)),
     ):
         with (
             pytest.raises(errors.InsufficientPrivilege),
@@ -333,6 +340,7 @@ def test_the_claim_functions_are_the_owner_s_and_granted_to_these_only(
         "ORDER BY proname",
         (
             [
+                "board_decide_after_failed_runs",
                 "board_new_item_id",
                 "claim_item",
                 "claims_end_on_close",
@@ -346,6 +354,7 @@ def test_the_claim_functions_are_the_owner_s_and_granted_to_these_only(
     path = ["search_path=pg_catalog, pg_temp"]
     mine = "board_owner=X/board_owner"
     assert rows == [
+        ("board_decide_after_failed_runs", False, path, "board_owner", f"{{{mine}}}"),
         ("board_new_item_id", False, path, "board_owner", f"{{{mine}}}"),
         ("claim_item", True, path, "board_owner", f"{{{mine},board_process=X/board_owner}}"),
         ("claims_end_on_close", True, path, "board_owner", f"{{{mine}}}"),
@@ -1109,6 +1118,164 @@ def test_a_decision_of_another_kind_closes_nothing_when_answered(
     close_as(app_url, OTHER, "answered", {"option": 2, "answer": "leave it"})
     assert state(owner, item)[4] is True
     assert claims_of(owner, item) == [("20260101-review-01", None, None, None)]
+
+
+# A refused result: a failed run, like an expiry
+
+
+def refused(app_url: str, item_id: str, run: str, holder: str | None = None) -> None:
+    """One claim whose run left no result that could be accepted, released as such."""
+    assert claim(app_url, item_id, run) == "claimed"
+    assert release(app_url, item_id, "result-refused", holder=holder) is True
+
+
+def decision_of(owner: psycopg.Connection, item_id: str) -> str | None:
+    """The decision the item's claims name, if any; one at most."""
+    rows = owner.execute(
+        "SELECT DISTINCT decision_id FROM claims WHERE item_id = %s AND decision_id IS NOT NULL",
+        (item_id,),
+    ).fetchall()
+    assert len(rows) <= 1
+    return rows[0][0] if rows else None
+
+
+@pytest.mark.parametrize(
+    "failures",
+    [("expired", "refused"), ("refused", "expired"), ("refused", "refused")],
+)
+def test_two_failed_runs_in_a_row_expired_or_refused_write_the_decision(
+    app_url: str, owner: psycopg.Connection, failures: tuple[str, str]
+) -> None:
+    insert_stage_row(owner, ITEM, urgent=True)
+    runs = ("20260101-work-01", "20260102-work-01")
+    told = {"expired": "ran out of time", "refused": "left no result that could be accepted"}
+
+    def fail(how: str, run: str) -> str | None:
+        if how == "expired":
+            return run_out(owner, app_url, ITEM, run)
+        refused(app_url, ITEM, run)
+        return decision_of(owner, ITEM)
+
+    # The first failed run writes nothing, and the item is in the queue again at once.
+    assert fail(failures[0], runs[0]) is None
+    assert owner.execute("SELECT count(*) FROM items").fetchone() == (1,)
+    assert queue(app_url) == [ITEM]
+
+    decision = fail(failures[1], runs[1])
+    assert decision is not None
+    assert decision_of(owner, ITEM) == decision
+    row = owner.execute(
+        "SELECT assignee, kind, claimed_by, created_by, urgent, subject_ref, fields "
+        "FROM items WHERE id = %s",
+        (decision,),
+    ).fetchone()
+    assert row is not None
+    assert row[:6] == ("operator", "decision", OPERATOR.identity, DISPATCHER.identity, True, "101")
+    parsed = parse_operator_item(row[6])
+    assert isinstance(parsed, Decision)
+    assert parsed.ticket == Ticket(repo=REPO, number=101)
+    assert parsed.options[0].startswith("Try again")
+    assert f"The work item {ITEM} failed twice in a row (" in parsed.summary
+    first, second = (f"run {run} {told[how]}" for run, how in zip(runs, failures, strict=True))
+    assert f"({first}, then {second})" in parsed.summary
+    if "refused" in failures:
+        assert "ran out of time twice" not in parsed.summary
+
+    # The item waits on it, and both claims name it. A refused result is a release: it
+    # counts in `releases`, not in `expiries`.
+    assert owner.execute("SELECT * FROM item_after").fetchall() == [(ITEM, decision)]
+    assert state(owner, ITEM) == (
+        None,
+        None,
+        failures.count("expired"),
+        failures.count("refused"),
+        True,
+    )
+    assert queue(app_url) == []
+    reasons = {"expired": ("expired", None), "refused": ("released", "result-refused")}
+    assert claims_of(owner, ITEM) == [
+        (run, *reasons[how], decision) for run, how in zip(runs, failures, strict=True)
+    ]
+    assert expire(app_url) == []
+
+
+def test_another_release_between_two_refused_results_neither_counts_nor_starts_the_row_again(
+    app_url: str, owner: psycopg.Connection, item: str
+) -> None:
+    refused(app_url, item, "20260101-review-01")
+    claim(app_url, item, "20260101-review-02")
+    release(app_url, item, "stopped")
+    assert decision_of(owner, item) is None
+    refused(app_url, item, "20260101-review-03")
+    decision = decision_of(owner, item)
+    assert decision is not None
+    assert state(owner, item) == (None, None, 0, 3, True)
+    assert claims_of(owner, item) == [
+        ("20260101-review-01", "released", "result-refused", decision),
+        ("20260101-review-02", "released", "stopped", None),
+        ("20260101-review-03", "released", "result-refused", decision),
+    ]
+
+
+@pytest.mark.parametrize("reason", ["start-failed", "infra-window", "usage-limit", "stopped"])
+def test_no_other_reason_counts_toward_the_decision(
+    app_url: str, owner: psycopg.Connection, item: str, reason: str
+) -> None:
+    """An expiry, then a release for this reason, twice over: still no decision."""
+    assert run_out(owner, app_url, item, "20260101-review-01") is None
+    claim(app_url, item, "20260101-review-02")
+    release(app_url, item, reason)
+    claim(app_url, item, "20260101-review-03")
+    release(app_url, item, reason)
+    assert owner.execute("SELECT count(*) FROM items WHERE kind = 'decision'").fetchone() == (0,)
+    assert decision_of(owner, item) is None
+    assert queue(app_url) == [item]
+
+
+def test_a_decision_after_a_refused_result_closes_the_item_on_stop(
+    app_url: str, owner: psycopg.Connection, item: str
+) -> None:
+    assert run_out(owner, app_url, item, "20260101-review-01") is None
+    refused(app_url, item, "20260101-review-02")
+    decision = decision_of(owner, item)
+    assert decision is not None
+    close_as(app_url, decision, "answered", {"option": 2, "answer": "Stop"})
+    row = owner.execute("SELECT resolution, result FROM items WHERE id = %s", (item,)).fetchone()
+    assert row == ("superseded", {"cause": "after", "item": decision, "resolution": "answered"})
+
+
+@pytest.mark.parametrize(
+    "holder", [None, "", "operator", "human:", "process:dispatcher", "human:a b"]
+)
+def test_a_refused_result_names_a_person_for_the_decision_or_nothing_is_released(
+    app_url: str, owner: psycopg.Connection, item: str, holder: str | None
+) -> None:
+    claim(app_url, item, "20260101-review-01")
+    before = row_of(owner, item)
+    with (
+        pytest.raises(errors.CheckViolation, match="held by a person"),
+        as_tier(app_url, DISPATCHER) as conn,
+    ):
+        conn.execute(RELEASE, (item, "result-refused", None, holder))
+    assert row_of(owner, item) == before
+    assert claims_of(owner, item) == [("20260101-review-01", None, None, None)]
+    if holder is not None:
+        # A holder given with another reason is checked too.
+        with pytest.raises(errors.CheckViolation, match="held by a person"):
+            release(app_url, item, "stopped", holder=holder)
+        assert row_of(owner, item) == before
+
+
+def test_only_a_failed_run_s_claim_names_a_decision(owner: psycopg.Connection, item: str) -> None:
+    insert_row(owner, id=OTHER, kind="decision", subject_ref="102")
+    for run, reason in (("20260101-review-01", "stopped"), ("20260101-review-02", None)):
+        owner.execute(
+            "INSERT INTO claims (run, item_id, token_sha256, expires_at, ended_at, ending, reason) "
+            "VALUES (%s, %s, %s, now(), now(), %s, %s)",
+            (run, item, sha(run), "released" if reason else "closed", reason),
+        )
+        with pytest.raises(errors.CheckViolation, match="claims_decision_on_failed_run"):
+            owner.execute("UPDATE claims SET decision_id = %s WHERE run = %s", (OTHER, run))
 
 
 # A close under a claim

@@ -171,7 +171,9 @@ KUBECTL_VERBS: tuple[str, ...] = tuple(verb.value for verb in KubectlVerb)
 
 
 class ReleaseReason(StrEnum):
-    """Why a run's claim was given back: a known interruption, which is not an expiry."""
+    """Why a run's claim was given back: a known interruption, which is not an expiry,
+    or a result that could not be accepted, which counts toward the decision item as an
+    expiry does."""
 
     # The run's unit did not start.
     START_FAILED = "start-failed"
@@ -181,6 +183,10 @@ class ReleaseReason(StrEnum):
     STOPPED = "stopped"
     # A deploy-check looked, and the change is not live yet.
     NOT_LIVE = "not-live"
+    # The run's result can't be accepted: the board refused it on close, it failed the
+    # schema check, or what the run left could not be collected. Two failed runs in a row,
+    # expiries and these mixed, write the decision item.
+    RESULT_REFUSED = "result-refused"
 
 
 # --- Field types -----------------------------------------------------------------------
