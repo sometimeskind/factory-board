@@ -137,7 +137,9 @@ async def test_a_run_reads_the_item_it_holds(board: Board) -> None:
     shown = await board.call(run, "my_item")
     assert (shown["id"], shown["kind"], shown["held_by"]) == (item_id, "deploy-check", run_name())
     assert shown["fields"]["merge_sha"] == SHA_B
-    assert [(c["run"], c["seat"]) for c in shown["claims"]] == [(RUN_ID, "deploy-check/1")]
+    assert [(c["run"], c["seat"], c["seat_type"]) for c in shown["claims"]] == [
+        (RUN_ID, "ottawa", "normal")
+    ]
     assert shown["replies"] == []
     assert token not in json.dumps(shown)
     # It reads no other item, and nothing else of the board.
