@@ -180,6 +180,48 @@ async def test_a_run_closes_its_item_with_the_result_and_its_token_dies(
         await board.call(run, "close_my_item", result=RESULT | {"outcome": "unhealthy"})
 
 
+UNHEALTHY = RESULT | {"outcome": "unhealthy", "summary": "The widget press restarts in a loop."}
+
+
+async def test_an_unhealthy_close_wakes_an_urgent_assess_item(board: Board) -> None:
+    run, _, _ = await running(board)
+    await board.call(run, "close_my_item", result=UNHEALTHY)
+    listed = await board.call(AS_RECONCILER, "list_pipeline_items")
+    assert [
+        (entry["kind"], entry["subject"], entry["reasons"], entry["urgent"])
+        for entry in listed["items"]
+    ] == [("assess", f"issue {REPO}#101", ["deploy-checks-closed"], True)]
+    queue = await board.call(test_server.AS_DISPATCHER, "list_claimable")
+    assert [(entry["kind"], entry["rank"]) for entry in queue["items"]] == [("assess", 1)]
+
+
+async def test_an_unhealthy_close_that_names_no_issue_wakes_assess_on_the_pr(
+    board: Board,
+) -> None:
+    bare = {k: v for k, v in DEPLOY_CHECK.items() if k != "issues"}
+    run, _, _ = await running(board, bare)
+    await board.call(run, "close_my_item", result=UNHEALTHY)
+    (woken,) = (await board.call(AS_RECONCILER, "list_pipeline_items"))["items"]
+    assert (woken["kind"], woken["subject"], woken["reasons"], woken["urgent"]) == (
+        "assess",
+        f"pr {REPO}#202",
+        ["deploy-checks-closed"],
+        True,
+    )
+    assert woken["created_by"] == "process:board"
+    assert woken["fields"] == {
+        "kind": "assess",
+        "issue": None,
+        "pr": {"repo": REPO, "number": 202},
+        "note": None,
+    }
+    # A healthy one wakes nothing.
+    other = await running(board, bare | {"number": 203}, "20260101-deploy-check-02")
+    await board.call(other[0], "close_my_item", result=RESULT)
+    listed = (await board.call(AS_RECONCILER, "list_pipeline_items"))["items"]
+    assert [entry["id"] for entry in listed] == [woken["id"]]
+
+
 async def test_a_result_is_checked_before_anything_is_written(board: Board) -> None:
     run, item_id, _ = await running(board)
     for result in ({"outcome": "healthy"}, RESULT | {"live": None}, STUCK):

@@ -34,5 +34,6 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 | `0010_pause.sql` | The pause flag: the one-row `pause` table, and `set_pause` and `lift_pause` for the operator |
 | `0011_seats_and_pause.sql` | The `seat` (a city's name) and `seat_type` (`normal` or `urgent`) columns on `claims`, with one running claim per seat; `claim_item` takes the seat and its type (an urgent seat for an urgent item only) and refuses while the factory is paused, except a `health` or a `digest` item (SQLSTATE `BRD05`); `set_pause` accepts the reconciler |
 | `0012_no_run_stage_items.sql` | `items_insert_no_run_stage_item`, a restrictive insert policy: a run inserts items for the operator only, never a stage's item (until assess gets its tools, which loosens it) |
+| `0013_urgent_assess.sql` | An `unhealthy` deploy-check close wakes an urgent `assess` item, and one on the PR when the check names no issue: `board_wake_assess` takes the subject's type and `urgent`, the `pending_urgent` column keeps an urgent wake that meets a held item, and `items_wake_assess`, `items_take_pending_reasons` and `items_carry_pending_wake` are replaced |
 
 The `schema_migrations` table is created by the runner itself.

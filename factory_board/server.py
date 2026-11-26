@@ -88,7 +88,9 @@ operator and reads them. The nightly creates keyed items, reads the replies on i
 closes its own. The reconciler writes the items that follow from what GitHub shows, for the
 pipeline's stages and for the operator, and closes them when the fact goes away. The board
 itself writes an issue's assess item when the operator's last open item that holds the issue
-closes, and when the last open deploy-check that names the issue closes. The
+closes, and when the last open deploy-check that names the issue closes: urgent when a
+deploy-check found the change unhealthy. An unhealthy deploy-check whose PR references no
+issue wakes an urgent assess item on the PR instead, whose fields name `pr` and no `issue`. The
 dispatcher reads the queue of the stages' items, claims one for each run it starts and
 releases a claim when a run is interrupted. A tool outside the caller's tier is refused.
 
@@ -268,6 +270,9 @@ def view(
         if item.pending_reasons:
             # Wakes that arrived while a run held the item; the board carries them on.
             out["pending_reasons"] = list(item.pending_reasons)
+        if item.pending_urgent:
+            # One of them was urgent: the item they move to becomes urgent.
+            out["pending_urgent"] = True
         if item.input_hash is not None:
             out["input_hash"] = item.input_hash
         if item.claim_expires is not None:
@@ -784,7 +789,9 @@ def build_server(
 
         A deploy-check lists the issues its merged PR references (`issues`): when the last
         open deploy-check that names an issue closes, the board writes that issue's assess
-        item itself. A deploy-check with closed_as is a record only: it is written closed
+        item itself, urgent when a run found the change unhealthy. An assess item is about an
+        issue (`issue`) or, as the board writes one for an unhealthy PR that references no
+        issue, a PR (`pr`). A deploy-check with closed_as is a record only: it is written closed
         (which wakes assess for its issues the same way), and a second write makes a second
         record, so look for the first with list_pipeline_items."""
 
@@ -1071,6 +1078,8 @@ def build_server(
 
         A deploy-check closes as healthy or unhealthy with what it took as live (an
         Application's synced revision, or the image a workload runs) and where to look.
+        Unhealthy makes the assess item the close wakes urgent, and wakes one on the PR when
+        the deploy-check names no issue.
         A change that is not live yet is no result: release the item until a later time
         with release_my_item. A change still not live a day after the merge closes as
         stuck, with the decision item written for the operator first (create_item).

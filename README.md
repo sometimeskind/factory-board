@@ -269,8 +269,9 @@ run holds.
   item, of any stage. The items the board writes itself after a run's close (the `assess`
   item a `deploy-check` wakes) are the board's and not the run's. The later PR that gives
   `assess` its tools loosens the rule for an `assess` run's `work` item.
-- Not built: an `unhealthy` close does not make the next `assess` item urgent, and a
-  `deploy-check` that names no issue wakes nothing.
+- An `unhealthy` close makes the `assess` item it wakes urgent, and one that names no issue
+  wakes an urgent `assess` item on its PR ([What the board does by
+  itself](#what-the-board-does-by-itself)).
 
 ### What the board does by itself
 
@@ -278,15 +279,22 @@ Three rules live in triggers (`migrations/0009_board_triggers.sql`) and act in t
 transaction that makes their fact true. No tier can call or switch them off.
 
 **Waking assess.** The board writes an issue's `assess` item, or merges into the open one:
-the item is due now, and the reason is appended. The item is ordinary, held by nobody and
-created by `process:board`.
+the item is due now, and the reason is appended. The item is held by nobody and created by
+`process:board`. It is ordinary, unless the wake is urgent (below): then a new item is
+written urgent and an open one becomes urgent. No wake makes an urgent item ordinary.
 
 | The fact | Reason | Detail |
 |---|---|---|
 | The operator's last open item that holds an issue closed | `operator-items-closed` | The item is about the issue and `holds`. However it closed (done, answered, replied, rejected, superseded, or down a reject's chain) and whoever closed it. A deferred or a waiting item is still open |
 | A `pr-approve` or `pr-merge` item closed as rejected or replied | `operator-items-closed` | For the issue in its `ticket`, and only when no item of the operator's holds that issue. Closed as done or superseded it wakes nothing: the PR goes on by itself |
-| The last open `deploy-check` that names an issue closed | `deploy-checks-closed` | For each issue in its `issues`, however it closed, also when it was written closed, and whatever the operator has open |
+| The last open `deploy-check` that names an issue closed | `deploy-checks-closed` | For each issue in its `issues`, however it closed, also when it was written closed, and whatever the operator has open. Urgent when this check, or another that names the issue and closed after the issue's last `assess` run started, closed `unhealthy` |
+| A `deploy-check` that names no issue closed `unhealthy` | `deploy-checks-closed` | On its PR, urgent: assess files the issue. Healthy, stuck or closed for a fact, it wakes nothing |
 
+- **The `assess` item on a PR** (`migrations/0013_urgent_assess.sql`) has `pr`
+  (`{"repo", "number"}`) in its fields and `issue` null; an issue's has `issue` and `pr`
+  null. It is one per PR like any stage's item, so a second unhealthy check on the PR takes
+  the open one. It is not in `list_assessments`, which is per issue, and names no issue for
+  `operator_acts`.
 - An item with `holds` false wakes nothing and keeps nothing waiting.
 - The decision written after two expired claims wakes nothing when it is answered with
   "try again", and nothing when its item is the issue's own `assess` item.
@@ -300,11 +308,14 @@ hash covers the issue's text and not the board's items, so nothing else would no
 - The reason is recorded on the held item, in `pending_reasons`, once each. What the run
   was started on (`reasons`, `not_before`) does not change. No tier can write the column;
   `get_item` shows it.
+- An urgent wake also sets `pending_urgent` (`get_item` shows it while it is true). Its
+  urgency goes where the reasons go, so the next run is urgent.
 - When the held item closes with reasons pending, however it closed, the board writes the
-  issue's next `assess` item in that transaction, due now and with those reasons, and
-  clears the record.
+  issue's (or the PR's) next `assess` item in that transaction, due now and with those
+  reasons, urgent if `pending_urgent` was set, and clears the record. The held item's own
+  urgency is not carried: its run dealt with it.
 - When the item goes back to the queue instead (its claim is released or runs out), the
-  pending reasons move into its `reasons`.
+  pending reasons move into its `reasons`, and a pending urgency makes it urgent.
 - An item that waits on the decision after two expired claims is held by no run, so a wake
   merges into it as into any open item, and goes with it if the operator stops it.
 - The reconciler's own trigger on a held item is still dropped (`merge_assess_trigger`):

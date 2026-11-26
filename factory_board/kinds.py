@@ -616,13 +616,27 @@ _OPERATOR_ITEM: TypeAdapter[OperatorItem] = TypeAdapter(OperatorItem)
 
 
 class Assess(_Model):
+    """An issue to assess, or a PR: the board writes one on a PR whose deploy check found
+    the change unhealthy when the PR references no issue, and assess files the issue. One
+    of `issue` and `pr` is set, and the other is None."""
+
     kind: Literal["assess"] = "assess"
-    issue: Ticket
+    issue: Ticket | None = None
+    pr: PullRequest | None = None
     # On a dated item: what to check once the date is reached.
     note: Prose | None = None
 
+    @model_validator(mode="after")
+    def _one_subject(self) -> Self:
+        if (self.issue is None) == (self.pr is None):
+            raise ValueError("an assess item is about an issue or a PR: set one of issue and pr")
+        return self
+
     @property
     def subject(self) -> Subject:
+        if self.pr is not None:
+            return Subject(repo=self.pr.repo, type=SubjectType.PR, ref=self.pr.number)
+        assert self.issue is not None
         return Subject(repo=self.issue.repo, type=SubjectType.ISSUE, ref=self.issue.number)
 
 
@@ -651,7 +665,9 @@ class DeployCheck(_PullRequestStageItem):
     kind: Literal["deploy-check"] = "deploy-check"
     merge_sha: HeadSha
     # The issues the merged PR references. When the last open deploy-check that names an
-    # issue closes, the board wakes assess for it; a check that names none wakes nothing.
+    # issue closes, the board wakes assess for it, urgent when a check found the change
+    # unhealthy; a check that names none wakes assess on the PR when it closes unhealthy,
+    # and nothing otherwise.
     issues: tuple[Ticket, ...] = Field(default=(), max_length=10)
 
     @model_validator(mode="after")

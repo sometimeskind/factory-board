@@ -223,6 +223,8 @@ class Item:
     # them to the next `assess` item when this one closes, or to `reasons` when it is
     # released or its claim runs out.
     pending_reasons: tuple[str, ...]
+    # True when one of those wakes was urgent: the item the reasons move to becomes urgent.
+    pending_urgent: bool
     input_hash: str | None
     head_sha_moves: tuple[dict[str, Any], ...]
     created_by: str
@@ -425,6 +427,7 @@ def _item(row: DictRow) -> Item:
         releases=row["releases"],
         reasons=tuple(row["reasons"]),
         pending_reasons=tuple(row["pending_reasons"]),
+        pending_urgent=row["pending_urgent"],
         input_hash=row["input_hash"],
         head_sha_moves=tuple(row["head_sha_moves"]),
         created_by=row["created_by"],
