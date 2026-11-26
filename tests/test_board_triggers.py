@@ -34,7 +34,7 @@ from pydantic import ValidationError
 
 from factory_board import metrics
 from factory_board.auth import Identity
-from factory_board.kinds import AssessReason, DeployCheck, parse_stage_item
+from factory_board.kinds import Assess, AssessReason, DeployCheck, parse_stage_item
 from factory_board.server import build_server
 from factory_board.store import (
     Caller,
@@ -205,6 +205,75 @@ async def test_a_deploy_check_names_its_issues(board: Board) -> None:
         await board.call(
             AS_RECONCILER, "write_stage_item", item=DEPLOY_CHECK | {"issues": [TICKET, TICKET]}
         )
+
+
+PR_ASSESS: dict[str, Any] = {"kind": "assess", "pr": {"repo": REPO, "number": 202}}
+
+
+def test_an_assess_item_is_about_an_issue_or_a_pr() -> None:
+    on_issue = parse_stage_item({"kind": "assess", "issue": TICKET})
+    on_pr = parse_stage_item(PR_ASSESS)
+    assert isinstance(on_issue, Assess) and isinstance(on_pr, Assess)
+    assert (on_issue.subject.label, on_pr.subject.label) == (
+        f"issue {REPO}#101",
+        f"pr {REPO}#202",
+    )
+    assert on_pr.model_dump(mode="json") == {
+        "kind": "assess",
+        "issue": None,
+        "pr": {"repo": REPO, "number": 202},
+        "note": None,
+    }
+    for bad in (
+        {"kind": "assess"},
+        {"kind": "assess", "issue": None, "pr": None},
+        PR_ASSESS | {"issue": TICKET},
+        {"kind": "assess", "pr": {"repo": REPO, "number": 0}},
+        {"kind": "assess", "pr": {"repo": REPO}},
+        {"kind": "assess", "pr": 202},
+    ):
+        with pytest.raises(ValidationError):
+            parse_stage_item(bad)
+
+
+async def test_an_assess_item_on_a_pr_is_listed_and_queued_like_any(
+    board: Board, conn: psycopg.Connection
+) -> None:
+    written = await board.call(
+        AS_RECONCILER, "write_stage_item", item=PR_ASSESS, reasons=["deploy-checks-closed"]
+    )
+    item = written["item"]
+    assert (written["status"], item["subject"]) == ("created", f"pr {REPO}#202")
+    assert written["confirmation"] == f"assess for pr {REPO}#202"
+    assert item["fields"] == {
+        "kind": "assess",
+        "issue": None,
+        "pr": {"repo": REPO, "number": 202},
+        "note": None,
+    }
+    again = await board.call(AS_RECONCILER, "write_stage_item", item=PR_ASSESS, reasons=["changed"])
+    assert (again["status"], again["item"]["id"]) == ("already open", item["id"])
+    assert await board.assessments() == [
+        (f"pr {REPO}#202", ["deploy-checks-closed", "changed"], RECONCILER.identity)
+    ]
+    queue = await board.call(AS_DISPATCHER, "list_claimable")
+    assert [(entry["id"], entry["rank"]) for entry in queue["items"]] == [(item["id"], 6)]
+    # No staleness hash is asked for: the hash is an issue's.
+    claimed = await board.call(
+        AS_DISPATCHER,
+        "claim",
+        item_id=item["id"],
+        run_id="20260101-assess-01",
+        cap_minutes=30,
+        seat="cairo",
+        seat_type="normal",
+    )
+    assert claimed["status"] == "claimed"
+    # Closed, it is no issue's last assessment.
+    conn.execute(
+        "UPDATE items SET closed_at = now(), resolution = 'done' WHERE id = %s", (item["id"],)
+    )
+    assert (await board.call(AS_RECONCILER, "list_assessments", repo=REPO))["items"] == []
 
 
 async def test_a_deploy_check_closed_for_a_fact_wakes_its_issues(board: Board) -> None:

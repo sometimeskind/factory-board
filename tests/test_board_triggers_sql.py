@@ -143,8 +143,13 @@ def test_the_last_item_s_close_writes_the_issue_s_assess_item(
     row = owner.execute("SELECT fields FROM items WHERE kind = 'assess'").fetchone()
     assert row is not None
     parsed = parse_stage_item(row[0])
-    assert isinstance(parsed, Assess)
-    assert (parsed.issue.repo, parsed.issue.number, parsed.note) == (REPO, 101, None)
+    assert isinstance(parsed, Assess) and parsed.issue is not None
+    assert (parsed.issue.repo, parsed.issue.number, parsed.pr, parsed.note) == (
+        REPO,
+        101,
+        None,
+        None,
+    )
 
 
 @pytest.mark.parametrize("resolution", ["done", "answered", "replied", "rejected", "superseded"])
@@ -590,19 +595,25 @@ def test_no_tier_writes_what_is_pending(
     app_url: str, owner: psycopg.Connection, caller: Caller
 ) -> None:
     hold(owner, app_url)
-    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
-        conn.execute("UPDATE items SET pending_reasons = ARRAY['new'] WHERE id = %s", (HELD,))
-    with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
-        insert_stage_row(
-            conn,
-            SECOND,
-            assignee="assess",
-            subject_ref="102",
-            created_by=caller.identity,
-            pending_reasons=["new"],
-        )
+    for column, value in (("pending_reasons", ["new"]), ("pending_urgent", True)):
+        with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+            conn.execute(
+                sql.SQL("UPDATE items SET {} = %s WHERE id = %s").format(sql.Identifier(column)),
+                (value, HELD),
+            )
+        with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
+            insert_stage_row(
+                conn,
+                SECOND,
+                assignee="assess",
+                subject_ref="102",
+                created_by=caller.identity,
+                **{column: value},
+            )
     with as_tier(app_url, caller) as conn:
-        assert conn.execute("SELECT pending_reasons FROM items").fetchall() == [([],)]
+        assert conn.execute("SELECT pending_reasons, pending_urgent FROM items").fetchall() == [
+            ([], False)
+        ]
 
 
 def test_only_an_assess_item_has_reasons_pending(owner: psycopg.Connection) -> None:
@@ -683,6 +694,220 @@ def test_a_deploy_check_that_names_no_issue_closes_and_wakes_nothing(
     )
     close(app_url, CHECK, "superseded", by=RECONCILER)
     assert owner.execute("SELECT count(*) FROM items WHERE kind = 'assess'").fetchone() == (0,)
+
+
+# ---- An unhealthy deploy check wakes an urgent assess item ----
+
+UNHEALTHY = {"kind": "deploy-check", "outcome": "unhealthy"}
+
+
+def look(
+    app_url: str,
+    owner: psycopg.Connection,
+    item_id: str,
+    outcome: str,
+    *numbers: int,
+    pr: int = 202,
+) -> None:
+    """A run's deploy-check on the PR, naming these issues, closes with this outcome."""
+    insert_check(owner, item_id, *numbers, pr=pr, claimed_by=RUN.identity)
+    close(app_url, item_id, by=RUN, result={"kind": "deploy-check", "outcome": outcome})
+
+
+def on_pr(owner: psycopg.Connection, number: int = 202) -> list[tuple[Any, ...]]:
+    """The open assess items of a PR: (reasons, holder, creator, urgent, fields)."""
+    return owner.execute(
+        "SELECT reasons, claimed_by, created_by, urgent, fields FROM items "
+        "WHERE kind = 'assess' AND closed_at IS NULL AND subject_type = 'pr' "
+        "AND subject_repo = %s AND subject_ref = %s ORDER BY created_at, id",
+        (REPO, str(number)),
+    ).fetchall()
+
+
+def urgency_of(owner: psycopg.Connection, item_id: str = HELD) -> tuple[Any, ...]:
+    """(urgent, pending_urgent) of an item."""
+    row = owner.execute(
+        "SELECT urgent, pending_urgent FROM items WHERE id = %s", (item_id,)
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+def test_an_unhealthy_close_writes_an_urgent_assess_item(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    look(app_url, owner, CHECK, "unhealthy", 101, 102)
+    for number in (101, 102):
+        assert assessments(owner, number) == [([DEPLOYS], None, None, "process:board", True)]
+    with as_tier(app_url, DISPATCHER) as conn:
+        ranks = conn.execute("SELECT rank FROM claimable").fetchall()
+    assert ranks == [(1,), (1,)]
+
+
+@pytest.mark.parametrize("outcome", ["healthy", "stuck"])
+def test_a_healthy_or_stuck_close_wakes_as_before(
+    app_url: str, owner: psycopg.Connection, outcome: str
+) -> None:
+    look(app_url, owner, CHECK, outcome, 101)
+    assert assessments(owner) == [([DEPLOYS], None, None, "process:board", False)]
+
+
+def test_only_a_run_s_unhealthy_close_is_urgent(app_url: str, owner: psycopg.Connection) -> None:
+    """The reconciler's and the operator's closes carry no outcome of a run's."""
+    insert_check(owner, CHECK, 101)
+    close(app_url, CHECK, "superseded", by=RECONCILER, result={"cause": "reverted"})
+    insert_check(owner, SECOND, 102, pr=203)
+    close(app_url, SECOND, "rejected", result={"reason": "unhealthy"})
+    assert (woken(owner), woken(owner, 102)) == ([[DEPLOYS]], [[DEPLOYS]])
+    assert [row[4] for row in assessments(owner) + assessments(owner, 102)] == [False, False]
+
+
+def test_an_unhealthy_close_makes_the_open_assess_item_urgent(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    insert_stage_row(
+        owner,
+        SECOND,
+        assignee="assess",
+        not_before="2999-01-01T00:00:00+00:00",
+        reasons=["dated"],
+        created_by=RECONCILER.identity,
+    )
+    look(app_url, owner, CHECK, "unhealthy", 101)
+    assert assessments(owner) == [(["dated", DEPLOYS], None, None, RECONCILER.identity, True)]
+
+
+def test_an_urgent_item_stays_urgent(app_url: str, owner: psycopg.Connection) -> None:
+    insert_stage_row(owner, SECOND, assignee="assess", reasons=["changed"], urgent=True)
+    look(app_url, owner, CHECK, "healthy", 101)
+    wake(owner, app_url)
+    assert [row[4] for row in assessments(owner)] == [True]
+    assert woken(owner) == [["changed", DEPLOYS, OPERATORS]]
+
+
+def test_a_check_that_found_it_unhealthy_makes_the_round_s_wake_urgent(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    """Two PRs for one issue: the issue is woken once, when the last check closes, and that
+    one was healthy. The other found the change unhealthy, and no run has seen it yet."""
+    insert_check(owner, SECOND, 101, pr=203)
+    look(app_url, owner, CHECK, "unhealthy", 101)
+    assert woken(owner) == []
+    close(app_url, SECOND, "superseded", by=RECONCILER, result={"cause": "reverted"})
+    assert assessments(owner) == [([DEPLOYS], None, None, "process:board", True)]
+
+
+def test_an_unhealthy_check_an_assess_run_has_seen_makes_nothing_urgent(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    look(app_url, owner, CHECK, "unhealthy", 101)
+    row = owner.execute("SELECT id FROM items WHERE kind = 'assess'").fetchone()
+    assert row is not None
+    woke = row[0]
+    with as_tier(app_url, DISPATCHER) as conn:
+        conn.execute(
+            "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+            (woke, RUN_ID, 30, sha(RUN_ID), "hash-1", "cairo", "urgent"),
+        )
+    owner.execute("UPDATE items SET closed_at = now(), resolution = 'done' WHERE id = %s", (woke,))
+    # A later round of the same issue, healthy: what the first run saw is not news.
+    look(app_url, owner, SECOND, "healthy", 101, pr=203)
+    assert assessments(owner) == [([DEPLOYS], None, None, "process:board", False)]
+
+
+def test_an_urgent_wake_on_a_held_item_waits_with_its_reasons(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url)
+    look(app_url, owner, CHECK, "unhealthy", 101)
+    # What the run was started on is not changed: the item is not urgent, its wake is.
+    assert reasons_of(owner) == (["changed"], [DEPLOYS], RUN.identity, True)
+    assert urgency_of(owner) == (False, True)
+    # A wake that is not urgent after it takes nothing away.
+    wake(owner, app_url)
+    assert reasons_of(owner)[1] == [DEPLOYS, OPERATORS]
+    assert urgency_of(owner) == (False, True)
+    close(app_url, HELD, by=RUN)
+    assert urgency_of(owner) == (False, False)
+    assert assessments(owner) == [([DEPLOYS, OPERATORS], None, None, "process:board", True)]
+
+
+@pytest.mark.parametrize("route", ["release", "expiry"])
+def test_a_held_item_back_in_the_queue_takes_the_urgency_that_waited(
+    app_url: str, owner: psycopg.Connection, route: str
+) -> None:
+    hold(owner, app_url)
+    look(app_url, owner, CHECK, "unhealthy", 101)
+    if route == "release":
+        with as_tier(app_url, RUN) as conn:
+            conn.execute("SELECT release_claim(%s, %s, NULL)", (HELD, "usage-limit"))
+    else:
+        owner.execute("UPDATE items SET claim_expires = now() - interval '1 minute'")
+        owner.execute("UPDATE claims SET expires_at = now() - interval '1 minute'")
+        with as_tier(app_url, DISPATCHER) as conn:
+            conn.execute("SELECT * FROM expire_claims(%s)", (OPERATOR.identity,))
+    assert reasons_of(owner) == (["changed", DEPLOYS], [], None, True)
+    assert urgency_of(owner) == (True, False)
+    with as_tier(app_url, DISPATCHER) as conn:
+        assert conn.execute("SELECT id, rank FROM claimable").fetchall() == [(HELD, 1)]
+
+
+def test_a_held_item_s_own_urgency_is_not_carried(app_url: str, owner: psycopg.Connection) -> None:
+    """Its run dealt with what made it urgent; only an urgent wake that waited is new."""
+    hold(owner, app_url, urgent=True)
+    wake(owner, app_url)
+    close(app_url, HELD, by=RUN)
+    assert assessments(owner) == [([OPERATORS], None, None, "process:board", False)]
+
+
+def test_an_unhealthy_check_that_names_no_issue_wakes_assess_on_its_pr(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    look(app_url, owner, CHECK, "unhealthy")
+    assert assessments(owner) == []
+    (fields,) = [row[4] for row in on_pr(owner)]
+    assert on_pr(owner) == [([DEPLOYS], None, "process:board", True, fields)]
+    assert fields == {
+        "kind": "assess",
+        "issue": None,
+        "pr": {"repo": REPO, "number": 202},
+        "note": None,
+    }
+    parsed = parse_stage_item(fields)
+    assert isinstance(parsed, Assess)
+    assert (parsed.issue, parsed.subject.label) == (None, f"pr {REPO}#202")
+    # A second check on the PR, unhealthy too, finds the open item: no second is written.
+    look(app_url, owner, SECOND, "unhealthy")
+    assert [row[:4] for row in on_pr(owner)] == [([DEPLOYS], None, "process:board", True)]
+    # Another PR's is its own.
+    look(app_url, owner, THIRD, "unhealthy", pr=203)
+    assert len(on_pr(owner, 203)) == 1
+    assert owner.execute("SELECT count(*) FROM items WHERE kind = 'assess'").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("outcome", ["healthy", "stuck"])
+def test_a_check_that_names_no_issue_and_is_not_unhealthy_wakes_nothing(
+    app_url: str, owner: psycopg.Connection, outcome: str
+) -> None:
+    look(app_url, owner, CHECK, outcome)
+    assert owner.execute("SELECT count(*) FROM items WHERE kind = 'assess'").fetchone() == (0,)
+
+
+def test_a_wake_on_a_pr_s_held_assess_item_waits_and_is_carried(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    hold(owner, app_url, subject_type="pr", subject_ref="202")
+    look(app_url, owner, CHECK, "unhealthy")
+    assert reasons_of(owner) == (["changed"], [DEPLOYS], RUN.identity, True)
+    assert urgency_of(owner) == (False, True)
+    close(app_url, HELD, by=RUN)
+    assert [row[:4] for row in on_pr(owner)] == [([DEPLOYS], None, "process:board", True)]
+
+
+def test_urgency_waits_only_beside_a_reason(owner: psycopg.Connection) -> None:
+    with pytest.raises(errors.CheckViolation, match="items_pending_urgent_with_reasons"):
+        insert_stage_row(owner, FIRST, assignee="assess", pending_urgent=True)
+    insert_stage_row(owner, FIRST, assignee="assess", pending_reasons=["new"], pending_urgent=True)
 
 
 @pytest.mark.parametrize("stage_name", ["review", "merge", "work"])
@@ -995,9 +1220,10 @@ def test_the_board_s_functions_are_the_owner_s_and_one_is_called_by_a_tier(
     owner: psycopg.Connection,
 ) -> None:
     rows = owner.execute(
-        "SELECT proname, prosecdef, proconfig, pg_get_userbyid(proowner), proacl::text "
+        "SELECT proname, pg_get_function_identity_arguments(oid), prosecdef, proconfig, "
+        "pg_get_userbyid(proowner), proacl::text "
         "FROM pg_proc WHERE pronamespace = 'public'::regnamespace AND proname = ANY(%s) "
-        "ORDER BY proname",
+        "ORDER BY proname, 2",
         (
             [
                 "board_wake_assess",
@@ -1014,18 +1240,27 @@ def test_the_board_s_functions_are_the_owner_s_and_one_is_called_by_a_tier(
     ).fetchall()
     path = ["search_path=pg_catalog, pg_temp"]
     mine = "board_owner=X/board_owner"
+    wake_arguments = "repo text, subject_type text, ref text, reasons text[], urgent boolean"
     assert rows == [
-        ("board_wake_assess", False, path, "board_owner", f"{{{mine}}}"),
-        ("item_issues", False, path, "board_owner", f"{{{mine}}}"),
-        ("items_carry_pending_wake", True, path, "board_owner", f"{{{mine}}}"),
-        ("items_note_operator_act", True, path, "board_owner", f"{{{mine}}}"),
+        # One only: the three-argument one of 0009, which could not be urgent, is gone.
+        ("board_wake_assess", wake_arguments, False, path, "board_owner", f"{{{mine}}}"),
+        ("item_issues", "item items", False, path, "board_owner", f"{{{mine}}}"),
+        ("items_carry_pending_wake", "", True, path, "board_owner", f"{{{mine}}}"),
+        ("items_note_operator_act", "", True, path, "board_owner", f"{{{mine}}}"),
         # A trigger's function that runs as the caller, like the one for a waiting item.
-        ("items_refuse_past_fix_forward_limit", False, path, "board_owner", None),
-        # It only moves the row's own reasons, for whoever unclaims the item.
-        ("items_take_pending_reasons", False, path, "board_owner", None),
-        ("items_wake_assess", True, path, "board_owner", f"{{{mine}}}"),
-        ("record_heartbeat", True, path, "board_owner", f"{{{mine},board_process=X/board_owner}}"),
-        ("replies_note_operator_act", True, path, "board_owner", f"{{{mine}}}"),
+        ("items_refuse_past_fix_forward_limit", "", False, path, "board_owner", None),
+        # It only moves the row's own reasons and urgency, for whoever unclaims the item.
+        ("items_take_pending_reasons", "", False, path, "board_owner", None),
+        ("items_wake_assess", "", True, path, "board_owner", f"{{{mine}}}"),
+        (
+            "record_heartbeat",
+            "",
+            True,
+            path,
+            "board_owner",
+            f"{{{mine},board_process=X/board_owner}}",
+        ),
+        ("replies_note_operator_act", "", True, path, "board_owner", f"{{{mine}}}"),
     ]
 
 
@@ -1034,7 +1269,7 @@ def test_no_tier_wakes_assess_itself(
     app_url: str, owner: psycopg.Connection, caller: Caller
 ) -> None:
     calls: list[LiteralString] = [
-        "SELECT board_wake_assess('example/repo', '101', ARRAY['operator-items-closed'])",
+        "SELECT board_wake_assess('example/repo', 'issue', '101', ARRAY['changed'], true)",
         "SELECT items_wake_assess()",
         "SELECT items_carry_pending_wake()",
         "SELECT items_note_operator_act()",
