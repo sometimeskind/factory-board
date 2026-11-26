@@ -31,13 +31,17 @@ from prometheus_client import REGISTRY
 from factory_board import metrics
 from factory_board.auth import Identity
 from factory_board.server import build_server, who
-from factory_board.store import Caller, Store, Tier
+from factory_board.store import Caller, RunToken, Store, Tier
 
 AS_OPERATOR = Identity(OPERATOR, operator_typed=True)
 AS_SESSION = Identity(SESSION, operator_typed=True)
 AS_NIGHTLY = Identity(NIGHTLY, operator_typed=False)
 AS_RECONCILER = Identity(RECONCILER, operator_typed=False)
 AS_DISPATCHER = Identity(DISPATCHER, operator_typed=False)
+# A run whose token names an item that is not there.
+AS_RUN = Identity(
+    RUN, operator_typed=False, run=RunToken("20260101-work-01", "abcdefgh", "deploy-check")
+)
 
 TICKET = {"repo": REPO, "number": 101}
 MANUAL: dict[str, Any] = {
@@ -104,6 +108,14 @@ TOOLS = {
     }
     | READS,
     "dispatcher": {"list_claimable", "claim", "release"} | READS,
+    "run": {"my_item", "close_my_item", "release_my_item", "create_item"},
+}
+RESULT: dict[str, Any] = {
+    "kind": "deploy-check",
+    "outcome": "healthy",
+    "live": {"by": "revision", "on": "widgets", "value": SHA_B},
+    "summary": "Synced and healthy.",
+    "evidence": ["the widgets Application"],
 }
 AHEAD = (datetime.now(UTC) + timedelta(days=2)).isoformat()
 # One call per tool that passes validation; the ID names no item.
@@ -138,6 +150,9 @@ CALLS: dict[str, dict[str, Any]] = {
     "release": {"item_id": "abcdefgh", "reason": "stopped"},
     "pause": {"reason": "the widget press is being moved"},
     "resume": {},
+    "my_item": {},
+    "close_my_item": {"result": RESULT},
+    "release_my_item": {"reason": "not-live", "not_before": AHEAD},
 }
 
 
@@ -146,7 +161,10 @@ class Board:
 
     def __init__(self, store: Store) -> None:
         self.identity = AS_SESSION
-        self.server = build_server(store, lambda: self.identity, "operator")
+        self.server = build_server(store, self.who, "operator")
+
+    async def who(self) -> Identity:
+        return self.identity
 
     async def call(self, identity: Identity, tool: str, **arguments: Any) -> dict[str, Any]:
         self.identity = identity
@@ -175,7 +193,7 @@ async def test_the_tools_are_the_three_rows(board: Board) -> None:
 
 
 @pytest.mark.parametrize(
-    "identity", [AS_OPERATOR, AS_SESSION, AS_NIGHTLY, AS_RECONCILER, AS_DISPATCHER]
+    "identity", [AS_OPERATOR, AS_SESSION, AS_NIGHTLY, AS_RECONCILER, AS_DISPATCHER, AS_RUN]
 )
 async def test_a_tool_outside_the_tier_s_row_is_refused(
     board: Board, store: Store, identity: Identity
@@ -601,7 +619,9 @@ async def pipeline(board: Board, **arguments: Any) -> list[dict[str, Any]]:
 async def test_the_two_processes_do_not_share_their_tools(board: Board) -> None:
     assert who(AS_NIGHTLY) == "nightly"
     assert who(AS_RECONCILER) == "reconciler"
-    assert who(Identity(RUN, operator_typed=False)) == "session"
+    # A run is no session: it has its own row, with or without what its token says.
+    assert who(Identity(RUN, operator_typed=False)) == "run"
+    assert who(AS_RUN) == "run"
     with pytest.raises(ToolError, match="not a tool of this caller's tier"):
         await board.call(AS_NIGHTLY, "write_stage_item", item=ASSESS)
     with pytest.raises(ToolError, match="not a tool of this caller's tier"):

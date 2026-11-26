@@ -238,7 +238,7 @@ async def test_the_operator_gets_several_items_on_one_issue(store: Store, pool: 
 async def test_a_second_open_stage_item_returns_the_first(store: Store, pool: Pool) -> None:
     first = await store.create_item(RECONCILER, stage("assess", 101))
     again = await store.create_item(
-        RUN, replace(stage("assess", 101), urgent=True, reasons=("edited",), input_hash="h2")
+        SESSION, replace(stage("assess", 101), urgent=True, reasons=("edited",), input_hash="h2")
     )
     assert again.existing is True
     # The item that was there, untouched by the second create.

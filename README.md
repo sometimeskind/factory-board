@@ -119,11 +119,18 @@ The tier belongs to the token (`factory_board/auth.py`), and is checked on every
 | The nightly | The nightly token | `process:nightly` | `board_process` |
 | The reconciler | The reconciler token | `process:reconciler` | `board_process` |
 | The dispatcher | The dispatcher token | `process:dispatcher` | `board_process` |
+| A stage's run | The token its claim returned, once | `run:<id>` | `board_agent` |
 
 - A static token is accepted only when the route header is exactly `private`. The private
   route must set that header and the public route must set it to `public`; a route that
   passes the client's own value through gives every tier to whoever knows a token.
 - Every session holds the same token, so a session's ID is asserted, not proven.
+- A run's token is not configured: the board mints it at the claim and keeps its SHA-256.
+  It is looked up in the database (`run_of_token`) at the HTTP layer and again on every
+  tool call, on the private route only, and says which run it is, which item the run holds
+  and at which stage. It is dead once the item closes or the claim is released or runs
+  out. It is a plain bearer token, so any coding harness can hold one. The runs' tokens are
+  accepted only on a board that has a static token configured.
 - `FACTORY_BOARD_DATABASE_URL` must be a URL (`postgresql://…`): the login proxy's store
   connects with asyncpg, which takes no conninfo string.
 
@@ -139,10 +146,11 @@ port of their own. A tool outside the caller's row is refused.
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
 | Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `pause`, `list_items`, `get_item`, `list_pipeline_items`, `list_assessments` |
 | Dispatcher | `list_claimable`, `claim`, `release`, `get_item`, `list_pipeline_items`, `list_assessments` |
+| Run | `my_item`, `close_my_item`, `release_my_item`, `create_item` |
 
 The operator and a session also have `list_pipeline_items` and `list_assessments`: the
-pipeline's queue can be read by every caller but the nightly. The three processes share a
-tier and are told apart by identity.
+pipeline's queue can be read by every caller but the nightly and a run. The three processes
+share a tier and are told apart by identity; so do a session and a run.
 The reconciler also has `list_items`, for its orphaned sweep: an issue with an open item of
 the operator's is not orphaned.
 
@@ -199,8 +207,8 @@ check the caller; no tier may write the claim columns or the counters.
   The run holds the item as `run:<id>` until ten minutes after the cap. The answer carries
   the run's token, once; the `claims` table keeps its SHA-256, in a column no tier can read.
   `run_of_token` says whose token it is while the claim runs: the token is dead when the
-  item closes, or the claim is released or runs out. Nothing accepts a run's token over HTTP
-  yet; that comes with the stages.
+  item closes, or the claim is released or runs out. The run signs in with it
+  ([A run's tools](#a-runs-tools)).
 - **A seat** (`migrations/0011_seats_and_pause.sql`) is a capital city's name, unique
   across the factory (`lisbon`, `buenos-aires`), and has a type of its own, `normal` or
   `urgent` (`seat_type`). The board checks only the spelling: up to 40 lower-case letters,
@@ -229,6 +237,40 @@ check the caller; no tier may write the claim columns or the counters.
   item as superseded; `answer` names it under `also_closed`.
 - `get_item` shows a stage item's `claims`: each run, its seat and the seat's type, when it
   claimed, and how the claim ended (`closed`, `released` with its reason, `expired`).
+
+### A run's tools
+
+A stage's run has four tools, and none takes an item's ID: the token says which item the
+run holds.
+
+- `my_item` reads that item, as `get_item` shows it. A run reads no other item.
+- `close_my_item` closes it as done, with the stage's result fields as the item's `result`.
+  It is the run's last act. The fields are a model per stage (`STAGE_RESULTS` in
+  `factory_board/kinds.py`); a stage without one can't close yet. Only `deploy-check` has
+  one:
+
+  | Field | Holds |
+  |---|---|
+  | `outcome` | `healthy`, `unhealthy` or `stuck` |
+  | `live` | What the run took as live: `by` (`revision` for an Application's synced revision, a full commit SHA; `image` for the image a workload runs), `on` (the Application, or `<namespace>/<name>`) and `value`. Left out for `stuck` |
+  | `summary` | What was found, in a line |
+  | `evidence` | 1 to 10 pointers, a line each: a log query, a pod, an Application, an alert |
+  | `decision` | For `stuck` only: the `decision` item the run wrote for the operator. The board checks that this run wrote it |
+
+- `release_my_item` gives the item back with a reason the stage may give (`RUN_RELEASES`).
+  A `deploy-check` whose change is not live yet releases with `not-live` and a `not_before`,
+  at most a day ahead. The other reasons are the dispatcher's. A release ends the run too.
+- `create_item` writes an item for the operator, of the kinds the stage may write
+  (`RUN_CREATES`): a `deploy-check` run a `decision`, for a change that is stuck. The item
+  is the run's (`created_by`, `created_run`) and the operator holds it.
+- This is checked in the server. In the database a run is an agent like a session: it may
+  close the item it holds while its claim runs, and insert items as itself, but only items
+  for the operator (`migrations/0012_no_run_stage_items.sql`): no run inserts a stage's
+  item, of any stage. The items the board writes itself after a run's close (the `assess`
+  item a `deploy-check` wakes) are the board's and not the run's. The later PR that gives
+  `assess` its tools loosens the rule for an `assess` run's `work` item.
+- Not built: an `unhealthy` close does not make the next `assess` item urgent, and a
+  `deploy-check` that names no issue wakes nothing.
 
 ### What the board does by itself
 

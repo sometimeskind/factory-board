@@ -150,8 +150,8 @@ async def served(
     mcp = FastMCP("test", auth=auth)
 
     @mcp.tool
-    def whoami() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        return describe(resolve())
+    async def whoami() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        return describe(await resolve())
 
     asgi = mcp.http_app()
     async with (
@@ -428,11 +428,11 @@ def signed_in(monkeypatch: pytest.MonkeyPatch, claims: dict[str, Any] | None) ->
     monkeypatch.setattr(auth_module, "get_access_token", lambda: token)
 
 
-def test_an_operator_in_the_group_is_a_human_at_the_operator_tier(
+async def test_an_operator_in_the_group_is_a_human_at_the_operator_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     signed_in(monkeypatch, {"sub": "u-1", "preferred_username": "olive", "groups": [GROUP, "x"]})
-    identity = identity_resolver(GROUP, None)()
+    identity = await identity_resolver(GROUP, None)()
     assert identity.caller.tier is Tier.OPERATOR
     assert identity.caller.identity == "human:olive"
     assert identity.operator_typed
@@ -454,19 +454,21 @@ def test_an_operator_in_the_group_is_a_human_at_the_operator_tier(
         ({"preferred_username": 7, "groups": [GROUP]}, "no usable username"),
     ],
 )
-def test_a_sign_in_without_the_group_or_a_username_is_refused(
+async def test_a_sign_in_without_the_group_or_a_username_is_refused(
     monkeypatch: pytest.MonkeyPatch, claims: dict[str, Any] | None, message: str
 ) -> None:
     signed_in(monkeypatch, claims)
     with pytest.raises(ToolError, match=message):
-        identity_resolver(GROUP, None)()
+        await identity_resolver(GROUP, None)()
 
 
-def test_a_static_name_in_a_proxy_token_gives_no_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_static_name_in_a_proxy_token_gives_no_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Only the verifier's own answer names a static token; claims never do."""
     signed_in(monkeypatch, {"sub": "nightly", "client_id": "nightly"})
     with pytest.raises(ToolError, match="not in the"):
-        identity_resolver(GROUP, None)()
+        await identity_resolver(GROUP, None)()
 
 
 # --- The proxy's table -----------------------------------------------------------------

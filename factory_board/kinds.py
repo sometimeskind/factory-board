@@ -15,6 +15,7 @@ Pure Python: no database, no MCP.
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from enum import StrEnum
 from typing import Annotated, Literal, Self
@@ -142,6 +143,24 @@ class NoDeployCheck(StrEnum):
     DEPLOYS_THROUGH_HOMELAB = "deploys-through-homelab"
 
 
+class DeployOutcome(StrEnum):
+    """What a deploy-check run found, once it looked at a change that is live."""
+
+    HEALTHY = "healthy"
+    UNHEALTHY = "unhealthy"
+    # Not live a day after the merge: the run stops looking and asks the operator.
+    STUCK = "stuck"
+
+
+class LiveBy(StrEnum):
+    """How a deploy-check run saw that the change is live."""
+
+    # The ArgoCD Application's synced revision.
+    REVISION = "revision"
+    # The image a workload runs.
+    IMAGE = "image"
+
+
 OPERATOR_KINDS: tuple[str, ...] = tuple(kind.value for kind in OperatorKind)
 STAGE_KINDS: tuple[str, ...] = tuple(kind.value for kind in StageKind)
 KINDS: tuple[str, ...] = OPERATOR_KINDS + STAGE_KINDS
@@ -218,6 +237,9 @@ RunId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,
 # board checks the spelling only; the list of seats is the dispatcher's.
 Seat = Annotated[str, StringConstraints(max_length=40, pattern=r"^[a-z]+(-[a-z]+)*$")]
 # The staleness hash of an issue, as the reconciler computes it.
+# An item's ID, as the store makes one.
+ItemRef = Annotated[str, StringConstraints(pattern=r"^[a-z0-9]{8}$")]
+
 ClaimHash = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
 
 # Kubernetes names, from k8s.io/apimachinery/pkg/util/validation (dns1123LabelFmt, 63
@@ -654,6 +676,80 @@ StageItem = Annotated[
 ]
 
 _STAGE_ITEM: TypeAdapter[StageItem] = TypeAdapter(StageItem)
+
+
+# --- Results ---------------------------------------------------------------------------
+# What a stage's run closes its item with. The fields are fixed, so the next stage and the
+# reconciler read them without parsing prose.
+
+# An Application, or a workload as <namespace>/<name>.
+LiveOn = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9./-]{0,199}$")]
+# A commit, or an image reference with its tag or digest.
+LiveValue = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,254}$")]
+
+
+class Live(_Model):
+    """What a deploy-check run took as "the change is live", and where it read it."""
+
+    by: LiveBy
+    on: LiveOn
+    value: LiveValue
+
+    @model_validator(mode="after")
+    def _a_revision_is_a_commit(self) -> Self:
+        if self.by is LiveBy.REVISION and not re.fullmatch(r"[0-9a-f]{40}", self.value):
+            raise ValueError("a revision is a full commit SHA")
+        return self
+
+
+class DeployCheckResult(_Model):
+    """A deploy-check run's close. A change that is not live yet is no result: the run
+    releases its claim until a later time instead."""
+
+    kind: Literal["deploy-check"] = "deploy-check"
+    outcome: DeployOutcome
+    # None for `stuck` only: the change never went live.
+    live: Live | None = None
+    # What was found, in a line.
+    summary: Prose
+    # Where to look: a log query, a pod, an Application, an alert. Pointers, not quotes.
+    evidence: tuple[Prose, ...] = Field(min_length=1, max_length=10)
+    # For `stuck` only: the decision item the run wrote for the operator.
+    decision: ItemRef | None = None
+
+    @model_validator(mode="after")
+    def _fields_fit_the_outcome(self) -> Self:
+        if self.outcome is DeployOutcome.STUCK:
+            if self.live is not None:
+                raise ValueError("a stuck change is not live: leave `live` out")
+            if self.decision is None:
+                raise ValueError("stuck needs `decision`: the decision item written for it")
+        else:
+            if self.live is None:
+                raise ValueError(f"{self.outcome.value} needs `live`: what was taken as live")
+            if self.decision is not None:
+                raise ValueError("`decision` is for a stuck change only")
+        return self
+
+
+# One model while one stage has a result; a union by `kind` once a second one does.
+StageResult = DeployCheckResult
+
+# A stage's result model. A stage that is not here has no run's close yet.
+STAGE_RESULTS: dict[str, type[StageResult]] = {
+    StageKind.DEPLOY_CHECK.value: DeployCheckResult,
+}
+
+# The operator kinds a stage's run may write. A stage that is not here writes none.
+RUN_CREATES: dict[str, frozenset[str]] = {
+    StageKind.DEPLOY_CHECK.value: frozenset({OperatorKind.DECISION.value}),
+}
+
+# The reasons a stage's run may give its own claim back with. The other reasons are the
+# dispatcher's: it knows why a run was interrupted.
+RUN_RELEASES: dict[str, frozenset[ReleaseReason]] = {
+    StageKind.DEPLOY_CHECK.value: frozenset({ReleaseReason.NOT_LIVE}),
+}
 
 
 def parse_operator_item(data: object) -> OperatorItem:

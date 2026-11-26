@@ -843,10 +843,13 @@ WORK = (
 )
 
 
-def assess_writes(app_url: str, item_id: str, number: int = 101) -> int:
-    """A run writes the issue's work item, as an assess run will; the rows written."""
-    with as_tier(app_url, RUN) as conn:
-        return conn.execute(WORK, (item_id, REPO, str(number), RUN.identity, RUN_ID)).rowcount
+def assess_writes(owner: psycopg.Connection, item_id: str, number: int = 101) -> int:
+    """The issue's work item in a run's name, as an assess run will write it; the rows written.
+
+    The owner writes it: no run inserts a stage's item until assess gets its tools (0012).
+    The limit is the trigger's, which reads `created_by` whoever inserts.
+    """
+    return owner.execute(WORK, (item_id, REPO, str(number), RUN.identity, RUN_ID)).rowcount
 
 
 def worked(
@@ -869,42 +872,38 @@ def limit(owner: psycopg.Connection) -> list[tuple[Any, ...]]:
     ).fetchall()
 
 
-def test_a_fourth_work_item_from_assess_is_refused(app_url: str, owner: psycopg.Connection) -> None:
+def test_a_fourth_work_item_from_assess_is_refused(owner: psycopg.Connection) -> None:
     for item_id in ("wwwwwww2", "wwwwwww3"):
         worked(owner, item_id)
     assert limit(owner) == [("101", 2, False)]
-    assert assess_writes(app_url, "wwwwwww4") == 1
+    assert assess_writes(owner, "wwwwwww4") == 1
     assert limit(owner) == [("101", 3, True)]
     # The third is still open: writing it again is not a fourth, and the open one stands.
-    assert assess_writes(app_url, "wwwwwww5") == 0
+    assert assess_writes(owner, "wwwwwww5") == 0
     owner.execute(
         "UPDATE items SET closed_at = now(), resolution = 'rejected' WHERE id = 'wwwwwww4'"
     )
 
     with pytest.raises(psycopg.Error, match="three work items") as refused:
-        assess_writes(app_url, "wwwwwww6")
+        assess_writes(owner, "wwwwwww6")
     assert refused.value.sqlstate == "BRD04"
     assert owner.execute("SELECT count(*) FROM items").fetchone() == (3,)
     # Another issue is not at its limit.
-    assert assess_writes(app_url, "wwwwwww7", 102) == 1
+    assert assess_writes(owner, "wwwwwww7", 102) == 1
 
 
 @pytest.mark.parametrize("ended", ["done", "rejected", "superseded"])
-def test_a_work_item_counts_however_it_ended(
-    app_url: str, owner: psycopg.Connection, ended: str
-) -> None:
+def test_a_work_item_counts_however_it_ended(owner: psycopg.Connection, ended: str) -> None:
     for item_id in ("wwwwwww2", "wwwwwww3", "wwwwwww4"):
         insert_stage_row(
             owner, item_id, created_by="run:20260101-assess-09", closed_at="now", resolution=ended
         )
     with pytest.raises(psycopg.Error) as refused:
-        assess_writes(app_url, "wwwwwww5")
+        assess_writes(owner, "wwwwwww5")
     assert refused.value.sqlstate == "BRD04"
 
 
-def test_only_work_items_a_run_wrote_for_the_issue_count(
-    app_url: str, owner: psycopg.Connection
-) -> None:
+def test_only_work_items_a_run_wrote_for_the_issue_count(owner: psycopg.Connection) -> None:
     # Continuation items are about the PR and the reconciler's; a session's is not assess's.
     for number, item_id in enumerate(("wwwwwww2", "wwwwwww3", "wwwwwww4"), start=202):
         insert_stage_row(
@@ -929,7 +928,7 @@ def test_only_work_items_a_run_wrote_for_the_issue_count(
             resolution="done",
         )
     assert limit(owner) == [("102", 1, False)]
-    assert assess_writes(app_url, "wwwwwww9") == 1
+    assert assess_writes(owner, "wwwwwww9") == 1
 
 
 def test_the_limit_is_for_a_run_s_work_item_only(app_url: str, owner: psycopg.Connection) -> None:
@@ -953,7 +952,7 @@ def test_the_count_starts_again_when_the_operator_acts(
 
     close(app_url, FIRST, "answered", result={"answer": "try once more"})
     assert limit(owner) == []
-    assert assess_writes(app_url, "wwwwwww5") == 1
+    assert assess_writes(owner, "wwwwwww5") == 1
     assert limit(owner) == [("101", 1, False)]
 
 
@@ -962,7 +961,7 @@ def test_the_count_starts_again_on_an_approval(app_url: str, owner: psycopg.Conn
         worked(owner, item_id)
     insert_pr_item(owner, FIRST, claimed_by=RECONCILER.identity)
     close(app_url, FIRST, by=RECONCILER, result={"cause": "approved"})
-    assert assess_writes(app_url, "wwwwwww5") == 1
+    assert assess_writes(owner, "wwwwwww5") == 1
 
 
 # ---- The reconciler's heartbeat ----

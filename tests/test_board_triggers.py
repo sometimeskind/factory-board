@@ -86,7 +86,10 @@ class Board:
 
     def __init__(self, store: Store) -> None:
         self.identity = AS_SESSION
-        self.server = build_server(store, lambda: self.identity, "operator")
+        self.server = build_server(store, self.who, "operator")
+
+    async def who(self) -> Identity:
+        return self.identity
 
     async def call(self, identity: Identity, tool: str, **arguments: Any) -> dict[str, Any]:
         self.identity = identity
@@ -229,32 +232,44 @@ async def test_a_deploy_check_written_closed_wakes_its_issues(board: Board) -> N
 # ---- the fix-forward limit ----
 
 
-async def assess_writes(store: Store, number: int = 101) -> Any:
-    """A run writes the issue's work item and holds it, so that it can close it here."""
-    return await store.create_item(RUN, stage("work", number, held_by=RUN.identity))
+RUN_ID = RUN.identity.partition(":")[2]
 
 
-async def test_the_store_refuses_a_fourth_work_item_from_a_run(store: Store) -> None:
+def assess_writes(conn: psycopg.Connection, number: int = 101) -> str:
+    """An assess run's work item on the issue, held by the run; its ID.
+
+    Written in the run's name past the store: no run inserts a stage's item until assess
+    gets its tools (0012). The limit is the trigger's, which reads `created_by`.
+    """
+    row = conn.execute(
+        "INSERT INTO items (id, assignee, kind, subject_repo, subject_type, subject_ref, "
+        "claimed_by, created_by, created_run) "
+        "VALUES (board_new_item_id(), 'work', 'work', %s, 'issue', %s, %s, %s, %s) RETURNING id",
+        (REPO, str(number), RUN.identity, RUN.identity, RUN_ID),
+    ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+async def test_the_store_refuses_a_fourth_work_item_from_a_run(
+    store: Store, conn: psycopg.Connection
+) -> None:
     for _ in range(2):
-        written = await assess_writes(store)
-        await store.close_item(RUN, written.item.id, Resolution.DONE)
-    third = await assess_writes(store)
-    assert third.existing is False
-    # Written again while it is open: the open one, and no refusal.
-    again = await assess_writes(store)
-    assert (again.existing, again.item.id) == (True, third.item.id)
-    await store.close_item(OPERATOR, third.item.id, Resolution.REJECTED, {"reason": "stop"})
+        await store.close_item(RUN, assess_writes(conn), Resolution.DONE)
+    third = assess_writes(conn)
+    await store.close_item(OPERATOR, third, Resolution.REJECTED, {"reason": "stop"})
 
     # The reject was the operator's act on the issue, so the count starts again.
     for _ in range(3):
-        written = await assess_writes(store)
-        await store.close_item(RUN, written.item.id, Resolution.DONE)
+        await store.close_item(RUN, assess_writes(conn), Resolution.DONE)
+    # The limit is checked before the rule that keeps a run from the insert: the run is
+    # told the limit.
     with pytest.raises(FixForwardLimit, match="three work items"):
-        await assess_writes(store)
+        await store.create_item(RUN, stage("work", 101, held_by=RUN.identity))
     assert (await store.stats(METRICS)).at_fix_forward_limit == 1
 
     # Another issue, a session's work item and a continuation item are not refused.
-    assert (await assess_writes(store, 102)).existing is False
+    assess_writes(conn, 102)
     assert (await store.create_item(SESSION, stage("work", 103))).existing is False
     continuation = replace(stage("work"), subject=pr(202))
     assert (await store.create_item(RECONCILER, continuation)).existing is False
@@ -262,7 +277,7 @@ async def test_the_store_refuses_a_fourth_work_item_from_a_run(store: Store) -> 
     # The operator's own item on the issue, once closed, frees it.
     mine = (await store.create_item(SESSION, manual(101))).item
     await store.close_item(OPERATOR, mine.id, Resolution.DONE)
-    assert (await assess_writes(store)).existing is False
+    assess_writes(conn)
     assert (await store.stats(METRICS)).at_fix_forward_limit == 0
 
 

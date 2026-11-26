@@ -54,7 +54,7 @@ async def serve(database_url: str, settings: ServerSettings) -> None:
     try:
         async with make_pool(database_url) as pool:
             store = Store(pool)
-            auth, static = build_auth(settings, postgres_store(proxy_pool))
+            auth, static = build_auth(settings, postgres_store(proxy_pool), store.run_for_token)
             mcp = build_server(
                 store,
                 identity_resolver(settings.operator_group, static),
