@@ -324,12 +324,18 @@ async def test_the_stats_count_the_queue_and_the_claims(
     assert all(isinstance(q, QueueCount) and abs(q.oldest_since - now) < 300 for q in stats.queue)
 
     # A claimed item is out of the queue; a released one is back, since its release.
-    await store.claim_item(DISPATCHER, held.id, "20260101-assess-01", 30, "hash-1")
-    await store.claim_item(DISPATCHER, review.id, "20260101-review-01", 30)
+    await store.claim_item(
+        DISPATCHER, held.id, "20260101-assess-01", 30, "hash-1", seat="cairo", seat_type="normal"
+    )
+    await store.claim_item(
+        DISPATCHER, review.id, "20260101-review-01", 30, seat="tokyo", seat_type="normal"
+    )
     conn.execute("UPDATE items SET created_at = created_at - interval '2 hours'")
     conn.execute("UPDATE claims SET claimed_at = claimed_at - interval '2 hours'")
     await store.release_claim(DISPATCHER, review.id, "usage-limit")
-    await store.claim_item(DISPATCHER, review.id, "20260101-review-02", 30)
+    await store.claim_item(
+        DISPATCHER, review.id, "20260101-review-02", 30, seat="seoul", seat_type="normal"
+    )
     conn.execute(
         "UPDATE items SET claim_expires = now() - interval '1 minute' WHERE id = %s", (review.id,)
     )
@@ -387,6 +393,8 @@ async def test_the_metrics_show_the_queue_the_claims_and_the_limit(
         run_id="20260101-assess-01",
         cap_minutes=30,
         input_hash="hash-1",
+        seat="cairo",
+        seat_type="normal",
     )
     await board.call(AS_DISPATCHER, "release", item_id=written["item"]["id"], reason="infra-window")
     metrics.show(await store.stats(METRICS))
@@ -411,6 +419,8 @@ async def test_the_metrics_show_the_queue_the_claims_and_the_limit(
         run_id="20260101-assess-02",
         cap_minutes=30,
         input_hash="hash-1",
+        seat="cairo",
+        seat_type="normal",
     )
     metrics.show(await store.stats(METRICS))
     assert sample("factory_board_claimable_items", stage="assess", urgent="false") == 0
@@ -433,6 +443,8 @@ async def held_assess(board: Board, run_id: str = "20260101-assess-01") -> str:
         run_id=run_id,
         cap_minutes=30,
         input_hash="hash-1",
+        seat="cairo",
+        seat_type="normal",
     )
     return item_id
 

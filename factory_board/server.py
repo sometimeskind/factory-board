@@ -41,6 +41,8 @@ from factory_board.kinds import (
     Rendered,
     Repo,
     RunId,
+    Seat,
+    SeatType,
     StageItem,
     SubjectType,
     parse_operator_item,
@@ -85,10 +87,12 @@ closes, and when the last open deploy-check that names the issue closes. The
 dispatcher reads the queue of the stages' items, claims one for each run it starts and
 releases a claim when a run is interrupted. A tool outside the caller's tier is refused.
 
-The operator can pause the factory (pause, with a reason) and lift the pause (resume). While
-it is paused the dispatcher starts no run but the health check and the digest; a run that
-is already going is not stopped, and items are written and closed as before. Pause only
-when the operator asks for it, and show them the answer.
+The operator can pause the factory (pause, with a reason) and lift the pause (resume). The
+reconciler pauses it too, when a check of its own trips; only the operator lifts a pause.
+While it is paused the dispatcher starts no run but the health check and the digest, and the
+board refuses any other claim; a run that is already going is not stopped, and items are
+written and closed as before. Pause only when the operator asks for it, and show them the
+answer.
 
 Every verb takes the item's ID, never a position in a list, and answers with a confirmation
 that repeats the item's subject and command: show it to the operator. A closed item stays
@@ -199,6 +203,8 @@ def claim_view(claim: Claim) -> dict[str, Any]:
         "run": claim.run,
         "item": claim.item_id,
         "stage": claim.stage,
+        "seat": claim.seat,
+        "seat_type": claim.seat_type,
         "urgent": claim.urgent,
         "claimed_at": _iso(claim.claimed_at),
         "expires": _iso(claim.expires_at),
@@ -857,8 +863,10 @@ def build_server(
 
     async def pause(reason: PauseReason) -> dict[str, Any]:
         """Pause the factory: the dispatcher starts no run but the health check and the
-        digest until `resume`. Runs that are going finish, and items are still written and
-        closed. A pause that already stands is kept, with its own time and reason."""
+        digest until `resume`, and the board refuses any other claim. Runs that are going
+        finish, and items are still written and closed. A pause that already stands is
+        kept, with its own time and reason. The reconciler calls it when its tripwire or
+        the self-stop trips; only the operator lifts a pause."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             standing, is_new = await store.set_pause(identity.caller, reason)
@@ -869,7 +877,7 @@ def build_server(
                 "paused": pause_view(standing),
             }
 
-        return await call("pause", OPERATOR, run)
+        return await call("pause", OPERATOR | RECONCILER, run)
 
     async def resume() -> dict[str, Any]:
         """Lift the pause: the dispatcher starts runs again on its next tick. The answer
@@ -892,8 +900,10 @@ def build_server(
         then `items` lists every stage's item a run may be started on, with its rank (1 is
         anything urgent, then health, digest, review, deploy-check, assess, work, retro) and
         the oldest first within a rank. `last_claims` are the two claims made last, newest
-        first, for the rule that alternates assess and work. `paused` is the operator's
-        pause (since, by, reason) or null: while it stands, start only health and digest."""
+        first, for the rule that alternates assess and work. `running` are the claims
+        that have not ended, each with its seat and the seat's type: those seats are taken.
+        `paused` is the pause that stands (since, by, reason) or null: while it does, start
+        only health and digest; a claim of anything else is refused."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             # Read before the queue: a pause set while this call runs is seen by the next.
@@ -909,6 +919,7 @@ def build_server(
                 )
             claimable = await store.list_claimable(identity.caller)
             last = await store.last_claims(identity.caller)
+            running = await store.running_claims(identity.caller)
             return {
                 "expired": [
                     {"item": entry.item_id, "run": entry.run, "decision": entry.decision_id}
@@ -916,6 +927,7 @@ def build_server(
                 ],
                 "items": [view(entry.item) | {"rank": entry.rank} for entry in claimable],
                 "last_claims": [claim_view(claim) for claim in last],
+                "running": [claim_view(claim) for claim in running],
                 "paused": pause_view(paused),
             }
 
@@ -928,6 +940,14 @@ def build_server(
             int,
             Field(ge=1, le=1440, description="the stage's time cap; the claim runs out 10 min on"),
         ],
+        seat: Annotated[
+            Seat,
+            Field(description="the seat the run takes: a city's name (lisbon) no run sits in"),
+        ],
+        seat_type: Annotated[
+            SeatType,
+            Field(description="the seat's type: an urgent seat takes an urgent item only"),
+        ],
         input_hash: Annotated[
             ClaimHash | None,
             Field(
@@ -936,15 +956,23 @@ def build_server(
             ),
         ] = None,
     ) -> dict[str, Any]:
-        """Claim a stage's item for one run, which then holds it as run:<run_id>. Answers
-        with the run's token, once: the board keeps only its hash, and the token is dead
-        when the item closes or the claim ends. An assess item is stamped with input_hash.
-        A work item assessed under another hash is closed as superseded instead, with status
-        "stale" and no token: start nothing. A run ID claims once."""
+        """Claim a stage's item for one run, which then holds it as run:<run_id> and sits
+        in `seat` until the claim ends. Answers with the run's token, once: the board keeps
+        only its hash, and the token is dead when the item closes or the claim ends. An
+        assess item is stamped with input_hash. A work item assessed under another hash is
+        closed as superseded instead, with status "stale" and no token: start nothing. A
+        run ID claims once. While the factory is paused only a health or a digest item is
+        claimed: any other claim is refused, and nothing is changed."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             claimed = await store.claim_item(
-                identity.caller, item_id, run_id, cap_minutes, input_hash
+                identity.caller,
+                item_id,
+                run_id,
+                cap_minutes,
+                input_hash,
+                seat=seat,
+                seat_type=seat_type.value,
             )
             if claimed.stale:
                 record("stale", claimed.item, identity)

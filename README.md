@@ -137,7 +137,7 @@ port of their own. A tool outside the caller's row is refused.
 | Operator | `list_items`, `get_item`, `done`, `answer`, `reply`, `defer`, `reject`, `bump`, `pause`, `resume` |
 | Session | `create_item`, `list_items`, `get_item`, `update_pr_head` |
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
-| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `list_items`, `get_item`, `list_pipeline_items`, `list_assessments` |
+| Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `pause`, `list_items`, `get_item`, `list_pipeline_items`, `list_assessments` |
 | Dispatcher | `list_claimable`, `claim`, `release`, `get_item`, `list_pipeline_items`, `list_assessments` |
 
 The operator and a session also have `list_pipeline_items` and `list_assessments`: the
@@ -163,18 +163,23 @@ the operator's is not orphaned.
 ### The pause flag
 
 The operator stops the factory from starting work with `pause` (a reason of at most 500
-characters) and lifts the stop with `resume`. The flag is the one row of the `pause` table
+characters) and lifts the stop with `resume`. The reconciler may `pause` too, for its
+tripwire and the self-stop; it cannot `resume`. The flag is the one row of the `pause` table
 (`migrations/0010_pause.sql`): there while the factory is paused, with since when, by whom
 and why.
 
-- The board only keeps the flag. `list_claimable` returns it as `paused` (`since`, `by`,
-  `reason`, or null), and the dispatcher then starts nothing but `health` and `digest`.
-  `claim` refuses nothing because of it, and a run that is going is not stopped.
+- `list_claimable` returns the flag as `paused` (`since`, `by`, `reason`, or null), and the
+  dispatcher then starts nothing but `health` and `digest`.
+- The board refuses too (`migrations/0011_seats_and_pause.sql`): while the pause stands,
+  `claim` is refused for every item but a `health` or a `digest` one, an urgent item
+  included (SQLSTATE `BRD05`, the tool's error "the factory is paused"). A run that is going
+  is not stopped, and it can still close or release its item.
 - A `pause` while one stands keeps the first, with its time and reason, and answers
   `already-paused`. A `resume` with none answers `not-paused`.
 - Only `resume` lifts a pause: it has no end date.
-- Every tier can read the table; `set_pause` and `lift_pause` are for the operator's tier
-  alone and check that the actor is a person.
+- Every tier can read the table. `set_pause` is for the operator's tier and the processes'
+  and checks that the actor is a person or `process:reconciler`; `lift_pause` is for the
+  operator's tier alone and checks that the actor is a person.
 
 ### Claims
 
@@ -187,12 +192,26 @@ check the caller; no tier may write the claim columns or the counters.
   item, without `merge` items. The order is the `claimable` view's rank (1 anything urgent,
   then `health`, `digest`, `review`, `deploy-check`, `assess`, `work`, `retro`), then the
   oldest. `last_claims` are the two claims made last, for the dispatcher's alternation rule.
-- `claim` takes the item, a run ID (used once, ever) and the stage's time cap in minutes.
+  `running` are the claims that have not ended, oldest first, each with its seat and the
+  seat's type.
+- `claim` takes the item, a run ID (used once, ever), the stage's time cap in minutes, and
+  the seat the run takes with its type.
   The run holds the item as `run:<id>` until ten minutes after the cap. The answer carries
   the run's token, once; the `claims` table keeps its SHA-256, in a column no tier can read.
   `run_of_token` says whose token it is while the claim runs: the token is dead when the
   item closes, or the claim is released or runs out. Nothing accepts a run's token over HTTP
   yet; that comes with the stages.
+- **A seat** (`migrations/0011_seats_and_pause.sql`) is a capital city's name, unique
+  across the factory (`lisbon`, `buenos-aires`), and has a type of its own, `normal` or
+  `urgent` (`seat_type`). The board checks only the spelling: up to 40 lower-case letters,
+  with single hyphens between words. Which seats there are, and at which stage each sits,
+  is the dispatcher's to know (the factory definition); the board neither checks that a
+  name is a real capital nor that the seat is at the item's stage. A seat is a name on the
+  claim and nothing else: no token and no tier belongs to it. The board holds two rules: an
+  urgent seat takes an urgent item only (a normal seat takes either), and one running claim
+  sits in a seat at a time (a claim that ran out keeps its seat until `list_claimable`
+  counts the expiry). A seat that is taken is refused like an item that is held. A claim
+  made before the migration has neither a seat nor a type.
 - `claim` takes the issue's current staleness hash for an `assess` item (it is stamped as
   `input_hash`) and for a `work` item that carries one: when they differ, the item closes as
   superseded (`{"cause": "stale"}`), the answer's status is `stale`, and nothing is claimed.
@@ -208,8 +227,8 @@ check the caller; no tier may write the claim columns or the counters.
   decision's first option, "try again", lets the item go for two more runs. Any other close
   of the decision (its second option, the operator's own text, a reject, a reply) closes the
   item as superseded; `answer` names it under `also_closed`.
-- `get_item` shows a stage item's `claims`: each run, when it claimed, and how the claim
-  ended (`closed`, `released` with its reason, `expired`).
+- `get_item` shows a stage item's `claims`: each run, its seat and the seat's type, when it
+  claimed, and how the claim ended (`closed`, `released` with its reason, `expired`).
 
 ### What the board does by itself
 
@@ -301,7 +320,7 @@ issue since the operator last acted on it (SQLSTATE `BRD04`; the store raises
     refused on.
   - `factory_board_reconciler_pass_timestamp_seconds`: the reconciler's last `heartbeat`;
     0 until the first one.
-  - `factory_board_paused`: 1 while the operator's pause stands, else 0.
+  - `factory_board_paused`: 1 while a pause stands, else 0.
 
 ## Settings
 

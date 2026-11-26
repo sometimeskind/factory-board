@@ -78,6 +78,13 @@ class SubjectType(StrEnum):
     FINDING = "finding"
 
 
+class SeatType(StrEnum):
+    """A seat's type: an urgent seat takes an urgent item only, a normal one any item."""
+
+    NORMAL = "normal"
+    URGENT = "urgent"
+
+
 class TerraformModule(StrEnum):
     """The root modules that have `plan-<module>` and `apply-<module>` recipes."""
 
@@ -207,6 +214,9 @@ Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._
 
 # A run's ID, as an identity's name: `run:<id>` holds the item it claimed.
 RunId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")]
+# A seat: a capital city's name, unique across the factory (`lisbon`, `buenos-aires`). The
+# board checks the spelling only; the list of seats is the dispatcher's.
+Seat = Annotated[str, StringConstraints(max_length=40, pattern=r"^[a-z]+(-[a-z]+)*$")]
 # The staleness hash of an issue, as the reconciler computes it.
 ClaimHash = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
 

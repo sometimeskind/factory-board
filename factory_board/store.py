@@ -55,6 +55,9 @@ _NOT_CLAIMABLE_SQLSTATE = "BRD03"
 # And what the fix-forward trigger raises for a fourth `work` item on an issue.
 _FIX_FORWARD_SQLSTATE = "BRD04"
 
+# And what claim_item raises while the factory is paused.
+_PAUSED_SQLSTATE = "BRD05"
+
 # How many items one item may wait on.
 MAX_AFTER = 10
 
@@ -138,6 +141,10 @@ class ItemWaiting(StoreError):
 
 class NotClaimable(StoreError):
     """The item can't be claimed for a run, or its claim can't be released."""
+
+
+class Paused(StoreError):
+    """The factory is paused, and the item is not one that is claimed all the same."""
 
 
 class FixForwardLimit(StoreError):
@@ -263,6 +270,10 @@ class Claim:
     ending: str | None
     reason: str | None
     decision_id: str | None
+    # The seat the run took, a city (`lisbon`), and its type, `normal` or `urgent`. Both
+    # None on a claim made before claims carried a seat.
+    seat: str | None
+    seat_type: str | None
 
 
 @dataclass(frozen=True)
@@ -429,7 +440,7 @@ def _item(row: DictRow) -> Item:
 _CLAIM = sql.SQL(
     """
     c.run, c.item_id, i.kind AS stage, i.urgent, c.claimed_at, c.expires_at, c.ended_at,
-    c.ending, c.reason, c.decision_id
+    c.ending, c.reason, c.decision_id, c.seat, c.seat_type
     """
 )
 
@@ -458,6 +469,8 @@ def _translate(exc: psycopg.Error) -> StoreError | None:
         return ItemWaiting(exc.diag.message_primary or "the item is waiting")
     if exc.sqlstate == _NOT_CLAIMABLE_SQLSTATE:
         return NotClaimable(exc.diag.message_primary or "the item is not claimable")
+    if exc.sqlstate == _PAUSED_SQLSTATE:
+        return Paused(exc.diag.message_primary or "the factory is paused")
     if exc.sqlstate == _FIX_FORWARD_SQLSTATE:
         return FixForwardLimit(exc.diag.message_primary or "the fix-forward limit is reached")
     if isinstance(exc, errors.InsufficientPrivilege):
@@ -952,6 +965,17 @@ class Store:
             )
             return [_claim(row) for row in await cur.fetchall()]
 
+    async def running_claims(self, caller: Caller) -> list[Claim]:
+        """The claims that have not ended, oldest first: the seats that are taken."""
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    "SELECT {} FROM claims AS c JOIN items AS i ON i.id = c.item_id "
+                    "WHERE c.ended_at IS NULL ORDER BY c.claimed_at, c.run"
+                ).format(_CLAIM)
+            )
+            return [_claim(row) for row in await cur.fetchall()]
+
     async def claim_item(
         self,
         caller: Caller,
@@ -959,19 +983,26 @@ class Store:
         run: str,
         cap_minutes: int,
         input_hash: str | None = None,
+        *,
+        seat: str,
+        seat_type: str,
     ) -> Claimed:
-        """Claim an item for one run, and mint the run's token. The dispatcher only.
+        """Claim an item for one run, from a seat, and mint the run's token. The
+        dispatcher only.
 
-        The claim runs out ten minutes after `cap_minutes`. `input_hash` is the issue's
-        current staleness hash: an `assess` item is stamped with it, and a `work` item
-        assessed under another one is closed as superseded instead (`Claimed.stale`).
-        Raises NotClaimable for an item that is held, deferred, waiting or no stage's.
+        The claim runs out ten minutes after `cap_minutes`. `seat` is a seat no run sits
+        in, and `seat_type` its type: an urgent seat takes an urgent item only. `input_hash`
+        is the issue's current staleness hash: an `assess` item is stamped with it, and a
+        `work` item assessed under another one is closed as superseded instead
+        (`Claimed.stale`). Raises NotClaimable for an item that is held, deferred, waiting
+        or no stage's, and for a seat that is taken; Paused while the factory is paused,
+        for any item but a `health` or a `digest` one.
         """
         token = new_run_token()
         async with self._as(caller) as conn:
             cur = await conn.execute(
-                "SELECT claim_item(%s, %s, %s, %s, %s)",
-                (item_id, run, cap_minutes, token_sha256(token), input_hash),
+                "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+                (item_id, run, cap_minutes, token_sha256(token), input_hash, seat, seat_type),
             )
             outcome = await cur.fetchone()
             item = await self._fetch(conn, item_id)
@@ -1030,8 +1061,8 @@ class Store:
         return None if row is None else Pause(*row)
 
     async def set_pause(self, caller: Caller, reason: str) -> tuple[Pause, bool]:
-        """Pause the factory, at the database's time. The operator only. A pause that
-        already stands is kept and returned with False."""
+        """Pause the factory, at the database's time. The operator, or the reconciler. A
+        pause that already stands is kept and returned with False."""
         async with self._as(caller) as conn:
             cur = await conn.execute("SELECT * FROM set_pause(%s)", (reason,))
             row = await cur.fetchone()
