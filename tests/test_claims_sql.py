@@ -1262,6 +1262,6 @@ def test_an_agent_s_item_with_no_end_is_closed_as_before(
         assert conn.execute(CLOSE, (ITEM,)).rowcount == 1
     policies = owner.execute(
         "SELECT policyname, permissive, roles::text, cmd FROM pg_policies "
-        "WHERE tablename = 'items' AND permissive = 'RESTRICTIVE'"
+        "WHERE tablename = 'items' AND permissive = 'RESTRICTIVE' AND cmd = 'UPDATE'"
     ).fetchall()
     assert policies == [("items_update_within_claim", "RESTRICTIVE", "{board_agent}", "UPDATE")]

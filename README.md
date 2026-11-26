@@ -264,8 +264,11 @@ run holds.
   (`RUN_CREATES`): a `deploy-check` run a `decision`, for a change that is stuck. The item
   is the run's (`created_by`, `created_run`) and the operator holds it.
 - This is checked in the server. In the database a run is an agent like a session: it may
-  close the item it holds while its claim runs, and insert items as itself. No policy keeps
-  a run from inserting a stage's item; no tool lets it.
+  close the item it holds while its claim runs, and insert items as itself, but only items
+  for the operator (`migrations/0012_no_run_stage_items.sql`): no run inserts a stage's
+  item, of any stage. The items the board writes itself after a run's close (the `assess`
+  item a `deploy-check` wakes) are the board's and not the run's. The later PR that gives
+  `assess` its tools loosens the rule for an `assess` run's `work` item.
 - Not built: an `unhealthy` close does not make the next `assess` item urgent, and a
   `deploy-check` that names no issue wakes nothing.
 

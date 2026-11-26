@@ -326,7 +326,8 @@ def test_the_insert_policies_hold_without_the_column_grants(owner: psycopg.Conne
     """The policies refuse a forged row by themselves: each names every forgeable column."""
     rows = owner.execute(
         "SELECT policyname, with_check FROM pg_policies "
-        "WHERE tablename = 'items' AND cmd = 'INSERT' ORDER BY policyname"
+        "WHERE tablename = 'items' AND cmd = 'INSERT' AND permissive = 'PERMISSIVE' "
+        "ORDER BY policyname"
     ).fetchall()
     assert [name for name, _ in rows] == [
         "items_insert_agent",
