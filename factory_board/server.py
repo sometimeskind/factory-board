@@ -42,6 +42,7 @@ from factory_board.kinds import (
     Repo,
     RunId,
     Seat,
+    SeatType,
     StageItem,
     SubjectType,
     parse_operator_item,
@@ -203,6 +204,7 @@ def claim_view(claim: Claim) -> dict[str, Any]:
         "item": claim.item_id,
         "stage": claim.stage,
         "seat": claim.seat,
+        "seat_type": claim.seat_type,
         "urgent": claim.urgent,
         "claimed_at": _iso(claim.claimed_at),
         "expires": _iso(claim.expires_at),
@@ -899,9 +901,9 @@ def build_server(
         anything urgent, then health, digest, review, deploy-check, assess, work, retro) and
         the oldest first within a rank. `last_claims` are the two claims made last, newest
         first, for the rule that alternates assess and work. `running` are the claims
-        that have not ended, each with its seat: those seats are taken. `paused` is the
-        pause that stands (since, by, reason) or null: while it does, start only health and
-        digest; a claim of anything else is refused."""
+        that have not ended, each with its seat and the seat's type: those seats are taken.
+        `paused` is the pause that stands (since, by, reason) or null: while it does, start
+        only health and digest; a claim of anything else is refused."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             # Read before the queue: a pause set while this call runs is seen by the next.
@@ -940,10 +942,11 @@ def build_server(
         ],
         seat: Annotated[
             Seat,
-            Field(
-                description="the seat the run takes, at the item's stage and free: "
-                "<stage>/<n>, or <stage>/urgent-<n> for an urgent item only"
-            ),
+            Field(description="the seat the run takes: a city's name (lisbon) no run sits in"),
+        ],
+        seat_type: Annotated[
+            SeatType,
+            Field(description="the seat's type: an urgent seat takes an urgent item only"),
         ],
         input_hash: Annotated[
             ClaimHash | None,
@@ -963,7 +966,13 @@ def build_server(
 
         async def run(identity: Identity) -> dict[str, Any]:
             claimed = await store.claim_item(
-                identity.caller, item_id, run_id, cap_minutes, input_hash, seat=seat
+                identity.caller,
+                item_id,
+                run_id,
+                cap_minutes,
+                input_hash,
+                seat=seat,
+                seat_type=seat_type.value,
             )
             if claimed.stale:
                 record("stale", claimed.item, identity)

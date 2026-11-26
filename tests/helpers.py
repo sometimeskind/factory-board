@@ -121,24 +121,93 @@ def row_of(conn: psycopg.Connection, item_id: str) -> tuple[Any, ...]:
     return row
 
 
+# The seats a made-up run sits in: nine capitals for each stage's runs, in order.
+RUN_SEATS = {
+    "health": ["lisbon", "madrid", "paris", "rome", "vienna", "berlin", "oslo", "dublin", "prague"],
+    "digest": [
+        "athens",
+        "warsaw",
+        "budapest",
+        "sofia",
+        "riga",
+        "tallinn",
+        "vilnius",
+        "bern",
+        "kyiv",
+    ],
+    "review": ["tokyo", "seoul", "hanoi", "manila", "jakarta", "bangkok", "dhaka", "kabul", "doha"],
+    "deploy-check": [
+        "ottawa",
+        "lima",
+        "quito",
+        "bogota",
+        "caracas",
+        "havana",
+        "santiago",
+        "asuncion",
+        "panama",
+    ],
+    "assess": [
+        "cairo",
+        "nairobi",
+        "accra",
+        "dakar",
+        "rabat",
+        "tunis",
+        "algiers",
+        "luanda",
+        "abuja",
+    ],
+    "work": [
+        "canberra",
+        "wellington",
+        "suva",
+        "apia",
+        "honiara",
+        "majuro",
+        "tarawa",
+        "funafuti",
+        "buenos-aires",
+    ],
+    "retro": [
+        "ankara",
+        "tehran",
+        "baghdad",
+        "amman",
+        "beirut",
+        "riyadh",
+        "muscat",
+        "baku",
+        "minsk",
+    ],
+}
+
+# The seats free_seat hands out: none is a run's, so the two never meet.
+FREE_SEATS = [
+    "brussels",
+    "amsterdam",
+    "copenhagen",
+    "stockholm",
+    "helsinki",
+    "reykjavik",
+    "valletta",
+    "nicosia",
+    "luxembourg",
+    "ljubljana",
+    "zagreb",
+    "belgrade",
+    "bucharest",
+    "chisinau",
+]
+
+
 def seat_of(run: str) -> str:
-    """The seat a made-up run sits in: `20260101-review-02` sits in `review/2`."""
+    """The seat a made-up run sits in, a normal one: `20260101-review-02` sits in `seoul`."""
     stage_name, _, number = run.split("-", 1)[1].rpartition("-")
-    return f"{stage_name}/{int(number)}"
+    return RUN_SEATS[stage_name][int(number) - 1]
 
 
-FREE_SEAT = """
-    SELECT i.kind || '/' || (
-        SELECT min(n) FROM generate_series(1, 99) AS n
-        WHERE NOT EXISTS (
-            SELECT FROM claims AS c WHERE c.ended_at IS NULL AND c.seat = i.kind || '/' || n
-        )
-    )
-    FROM items AS i WHERE i.id = %s
-"""
-
-
-def free_seat(conn: psycopg.Connection, item_id: str) -> str:
-    """The first free normal seat at the item's stage; `review/1` for an item that is not there."""
-    row = conn.execute(FREE_SEAT, (item_id,)).fetchone()
-    return "review/1" if row is None else row[0]
+def free_seat(conn: psycopg.Connection) -> str:
+    """The first of FREE_SEATS that no running claim sits in, a normal one."""
+    taken = {row[0] for row in conn.execute("SELECT seat FROM claims WHERE ended_at IS NULL")}
+    return next(seat for seat in FREE_SEATS if seat not in taken)

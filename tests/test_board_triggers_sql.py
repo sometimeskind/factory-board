@@ -343,8 +343,16 @@ def stuck(owner: psycopg.Connection, app_url: str, kind: str) -> str:
     for run in (f"20260101-{kind}-01", f"20260101-{kind}-02"):
         with as_tier(app_url, DISPATCHER) as conn:
             conn.execute(
-                "SELECT claim_item(%s, %s, %s, %s, %s, %s)",
-                (FIRST, run, 30, sha(run), "hash-1" if kind == "assess" else None, f"{kind}/1"),
+                "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    FIRST,
+                    run,
+                    30,
+                    sha(run),
+                    "hash-1" if kind == "assess" else None,
+                    "lisbon",
+                    "normal",
+                ),
             )
         owner.execute(
             "UPDATE items SET claim_expires = now() - interval '1 minute' WHERE id = %s", (FIRST,)
@@ -417,8 +425,8 @@ def hold(owner: psycopg.Connection, app_url: str, **overrides: Any) -> None:
     insert_stage_row(owner, HELD, assignee="assess", reasons=["changed"], **overrides)
     with as_tier(app_url, DISPATCHER) as conn:
         conn.execute(
-            "SELECT claim_item(%s, %s, %s, %s, %s, %s)",
-            (HELD, RUN_ID, 30, sha(RUN_ID), "hash-1", "assess/1"),
+            "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+            (HELD, RUN_ID, 30, sha(RUN_ID), "hash-1", "lisbon", "normal"),
         )
 
 
@@ -522,8 +530,8 @@ def test_a_release_hands_what_waited_to_the_item(app_url: str, owner: psycopg.Co
     with as_tier(app_url, DISPATCHER) as conn:
         run = "20260101-assess-02"
         conn.execute(
-            "SELECT claim_item(%s, %s, %s, %s, %s, %s)",
-            (HELD, run, 30, sha(run), "hash-1", "assess/2"),
+            "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+            (HELD, run, 30, sha(run), "hash-1", "oslo", "normal"),
         )
     owner.execute("UPDATE items SET closed_at = now(), resolution = 'done' WHERE id = %s", (HELD,))
     assert woken(owner) == []
@@ -766,8 +774,8 @@ def test_what_a_process_or_a_session_does_is_no_act(
         conn.execute("SELECT merge_assess_trigger(%s, NULL, ARRAY['changed'])", (SECOND,))
     with as_tier(app_url, DISPATCHER) as conn:
         conn.execute(
-            "SELECT claim_item(%s, %s, %s, %s, %s, %s)",
-            (SECOND, "20260101-assess-01", 30, sha("x"), "hash-1", "assess/1"),
+            "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+            (SECOND, "20260101-assess-01", 30, sha("x"), "hash-1", "lisbon", "normal"),
         )
     insert_row(
         owner,

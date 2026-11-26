@@ -132,7 +132,8 @@ CALLS: dict[str, dict[str, Any]] = {
         "item_id": "abcdefgh",
         "run_id": "20260101-review-01",
         "cap_minutes": 30,
-        "seat": "review/1",
+        "seat": "lisbon",
+        "seat_type": "normal",
     },
     "release": {"item_id": "abcdefgh", "reason": "stopped"},
     "pause": {"reason": "the widget press is being moved"},
@@ -782,8 +783,8 @@ async def staged(board: Board, item: dict[str, Any], **arguments: Any) -> str:
 
 
 async def claim(board: Board, item_id: str, run_id: str, **arguments: Any) -> dict[str, Any]:
-    """Claim as the dispatcher, from the seat the run's ID names unless one is given."""
-    arguments = {"seat": seat_of(run_id)} | arguments
+    """Claim as the dispatcher, from the normal seat the run's ID names unless one is given."""
+    arguments = {"seat": seat_of(run_id), "seat_type": "normal"} | arguments
     return await board.call(
         AS_DISPATCHER, "claim", item_id=item_id, run_id=run_id, cap_minutes=30, **arguments
     )
@@ -821,7 +822,13 @@ async def test_the_three_processes_do_not_share_their_tools(board: Board) -> Non
     for identity in (AS_RECONCILER, AS_NIGHTLY, AS_SESSION, AS_OPERATOR):
         with pytest.raises(ToolError, match="not a tool of this caller's tier"):
             await board.call(
-                identity, "claim", item_id=item_id, run_id="r1", cap_minutes=30, seat="review/1"
+                identity,
+                "claim",
+                item_id=item_id,
+                run_id="r1",
+                cap_minutes=30,
+                seat="tokyo",
+                seat_type="normal",
             )
     with pytest.raises(ToolError, match="not a tool of this caller's tier"):
         await board.call(AS_DISPATCHER, "close_for_fact", item_id=item_id, cause="merged")
@@ -873,14 +880,15 @@ async def test_the_queue_lists_what_ran_out_the_items_and_the_last_claims(
         "item",
         "stage",
         "seat",
+        "seat_type",
         "urgent",
         "claimed_at",
         "expires",
         "ending",
     }
-    assert [(c["run"], c["seat"]) for c in listed["running"]] == [
-        ("20260101-review-01", "review/1"),
-        ("20260101-assess-01", "assess/1"),
+    assert [(c["run"], c["seat"], c["seat_type"]) for c in listed["running"]] == [
+        ("20260101-review-01", "tokyo", "normal"),
+        ("20260101-assess-01", "cairo", "normal"),
     ]
 
     # The claims that ran out are counted before the queue is read.
@@ -909,7 +917,8 @@ async def test_a_claim_answers_with_the_run_s_token_once(
         item_id=item_id,
         run_id="20260101-review-01",
         cap_minutes=45,
-        seat="review/1",
+        seat="tokyo",
+        seat_type="normal",
     )
     assert (claimed["status"], claimed["confirmation"]) == ("claimed", REVIEW_LABEL)
     token = claimed["token"]
@@ -928,7 +937,8 @@ async def test_a_claim_answers_with_the_run_s_token_once(
                 "run": "20260101-review-01",
                 "item": item_id,
                 "stage": "review",
-                "seat": "review/1",
+                "seat": "tokyo",
+                "seat_type": "normal",
                 "urgent": False,
                 "claimed_at": shown["claims"][0]["claimed_at"],
                 "expires": shown["claim_expires"],
@@ -971,11 +981,16 @@ async def test_a_claim_answers_with_the_run_s_token_once(
         {"input_hash": ""},
         {"token": "mine"},
         {"claimed_by": "run:20260101-review-09"},
-        {"seat": "assess"},
-        {"seat": "assess/0"},
-        {"seat": "review/1"},
-        {"seat": "assess/urgent-1"},
+        {"seat": "assess/1"},
+        {"seat": "work/1"},
+        {"seat": "Cairo"},
+        {"seat": "cairo-"},
+        {"seat": "a" * 41},
         {"seat": None},
+        {"seat_type": "vip"},
+        {"seat_type": None},
+        # The item is not urgent.
+        {"seat_type": "urgent"},
     ],
 )
 async def test_a_claim_is_checked(board: Board, bad: dict[str, Any]) -> None:
@@ -985,7 +1000,8 @@ async def test_a_claim_is_checked(board: Board, bad: dict[str, Any]) -> None:
         "run_id": "20260101-assess-01",
         "cap_minutes": 30,
         "input_hash": "h1",
-        "seat": "assess/1",
+        "seat": "cairo",
+        "seat_type": "normal",
     }
     arguments = good | bad
     with pytest.raises(ToolError):

@@ -2,20 +2,26 @@
 
 -- ---- The seat ----
 
--- A seat is a place at a stage, of a type: `review/1` is a normal seat, `review/urgent-1`
--- an urgent one. How many a stage has is the dispatcher's to know (the factory definition);
--- the board keeps the name on the claim and holds two rules: the seat is at the item's
--- stage, and one run sits in it at a time. A claim made before this migration has none.
+-- A seat is a capital city's name, unique across the factory (`lisbon`, `buenos-aires`),
+-- of a type: `normal` or `urgent`. Which seats there are, and at which stage each sits, is
+-- the dispatcher's to know (the factory definition); the board checks only the spelling,
+-- keeps the name and the type on the claim and holds two rules: an urgent seat takes an
+-- urgent item only, and one run sits in a seat at a time. A claim made before this
+-- migration has neither.
 ALTER TABLE claims
     ADD COLUMN seat text
         CONSTRAINT claims_seat_format
-            CHECK (seat ~ '^[a-z][a-z-]{0,29}/(urgent-)?[1-9][0-9]?$');
+            CHECK (seat ~ '^[a-z]+(-[a-z]+)*$' AND char_length(seat) <= 40),
+    ADD COLUMN seat_type text
+        CONSTRAINT claims_seat_type_allowed
+            CHECK (seat_type IN ('normal', 'urgent')),
+    ADD CONSTRAINT claims_seat_with_type CHECK ((seat IS NULL) = (seat_type IS NULL));
 
 -- At most one running claim per seat. A claim that ran out still sits in its seat until
 -- the dispatcher counts the expiry, which it does before it reads the queue.
 CREATE UNIQUE INDEX claims_seat_occupied ON claims (seat) WHERE ended_at IS NULL;
 
-GRANT SELECT (seat) ON claims TO board_operator, board_agent, board_process;
+GRANT SELECT (seat, seat_type) ON claims TO board_operator, board_agent, board_process;
 
 -- ---- The pause, set by the reconciler too ----
 
@@ -61,8 +67,8 @@ GRANT EXECUTE ON FUNCTION set_pause(text) TO board_process;
 
 -- As in 0008_claims.sql, with two additions.
 --
--- The seat: the claim names it, it is at the item's stage, an urgent seat takes an urgent
--- item only, and nobody sits in it (BRD03, like any item that can't be claimed now).
+-- The seat: the claim names it and its type, an urgent seat takes an urgent item only, and
+-- nobody sits in it (BRD03, like any item that can't be claimed now).
 --
 -- The pause: while it stands nothing is claimed but a `health` or a `digest` item (BRD05:
 -- the store reads this code as "paused"). Until now only the dispatcher's own gate kept
@@ -71,7 +77,13 @@ GRANT EXECUTE ON FUNCTION set_pause(text) TO board_process;
 DROP FUNCTION claim_item(text, text, integer, text, text);
 
 CREATE FUNCTION claim_item(
-    item text, run text, cap_minutes integer, token_sha256 text, current_hash text, seat text
+    item text,
+    run text,
+    cap_minutes integer,
+    token_sha256 text,
+    current_hash text,
+    seat text,
+    seat_type text
 ) RETURNS text
     LANGUAGE plpgsql
     SECURITY DEFINER
@@ -101,9 +113,12 @@ BEGIN
         RAISE EXCEPTION 'a staleness hash is up to 128 letters, digits, ''.'', ''_'', '':'' or ''-'''
             USING ERRCODE = 'check_violation';
     END IF;
-    IF seat IS NULL OR seat !~ '^[a-z][a-z-]{0,29}/(urgent-)?[1-9][0-9]?$' THEN
-        RAISE EXCEPTION 'a seat is <stage>/<n> or <stage>/urgent-<n>, with n from 1 to 99'
+    IF seat IS NULL OR seat !~ '^[a-z]+(-[a-z]+)*$' OR char_length(seat) > 40 THEN
+        RAISE EXCEPTION 'a seat is a city''s name of up to 40 lower-case letters and ''-'''
             USING ERRCODE = 'check_violation';
+    END IF;
+    IF seat_type IS NULL OR seat_type NOT IN ('normal', 'urgent') THEN
+        RAISE EXCEPTION 'a seat''s type is normal or urgent' USING ERRCODE = 'check_violation';
     END IF;
 
     SELECT * INTO found_item
@@ -134,11 +149,7 @@ BEGIN
             USING ERRCODE = 'check_violation';
     END IF;
 
-    IF split_part(seat, '/', 1) <> found_item.kind THEN
-        RAISE EXCEPTION 'seat % is not at the % stage', seat, found_item.kind
-            USING ERRCODE = 'check_violation';
-    END IF;
-    IF split_part(seat, '/', 2) ~ '^urgent-' AND NOT found_item.urgent THEN
+    IF seat_type = 'urgent' AND NOT found_item.urgent THEN
         RAISE EXCEPTION 'seat % is for an urgent item, and item % is not urgent', seat, item
             USING ERRCODE = 'check_violation';
     END IF;
@@ -182,17 +193,19 @@ BEGIN
                 ELSE i.input_hash
             END
         WHERE i.id = claim_item.item;
-    INSERT INTO public.claims (run, item_id, token_sha256, expires_at, seat)
+    INSERT INTO public.claims (run, item_id, token_sha256, expires_at, seat, seat_type)
         VALUES (
             claim_item.run,
             claim_item.item,
             claim_item.token_sha256,
             now() + make_interval(mins => claim_item.cap_minutes + 10),
-            claim_item.seat
+            claim_item.seat,
+            claim_item.seat_type
         );
     RETURN 'claimed';
 END
 $$;
 
-REVOKE ALL ON FUNCTION claim_item(text, text, integer, text, text, text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION claim_item(text, text, integer, text, text, text) TO board_process;
+REVOKE ALL ON FUNCTION claim_item(text, text, integer, text, text, text, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION claim_item(text, text, integer, text, text, text, text)
+    TO board_process;

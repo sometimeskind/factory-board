@@ -192,23 +192,26 @@ check the caller; no tier may write the claim columns or the counters.
   item, without `merge` items. The order is the `claimable` view's rank (1 anything urgent,
   then `health`, `digest`, `review`, `deploy-check`, `assess`, `work`, `retro`), then the
   oldest. `last_claims` are the two claims made last, for the dispatcher's alternation rule.
-  `running` are the claims that have not ended, oldest first, each with its seat.
-- `claim` takes the item, a run ID (used once, ever), the stage's time cap in minutes and
-  the seat the run takes.
+  `running` are the claims that have not ended, oldest first, each with its seat and the
+  seat's type.
+- `claim` takes the item, a run ID (used once, ever), the stage's time cap in minutes, and
+  the seat the run takes with its type.
   The run holds the item as `run:<id>` until ten minutes after the cap. The answer carries
   the run's token, once; the `claims` table keeps its SHA-256, in a column no tier can read.
   `run_of_token` says whose token it is while the claim runs: the token is dead when the
   item closes, or the claim is released or runs out. Nothing accepts a run's token over HTTP
   yet; that comes with the stages.
-- **A seat** is a place at a stage (`migrations/0011_seats_and_pause.sql`): `<stage>/<n>`
-  is a normal seat and `<stage>/urgent-<n>` an urgent one, with n from 1 to 99 (`review/1`,
-  `review/urgent-1`). It is a name on the claim and nothing else: no token and no tier
-  belongs to it. The board holds three rules: the seat is at the item's stage, an urgent
-  seat takes an urgent item only (a normal seat takes either), and one running claim sits
-  in a seat at a time (a claim that ran out keeps its seat until `list_claimable` counts
-  the expiry). A seat that is taken is refused like an item that is held. How many seats a
-  stage has is the dispatcher's to know; the board accepts any number up to 99. A claim
-  made before the migration has no seat.
+- **A seat** (`migrations/0011_seats_and_pause.sql`) is a capital city's name, unique
+  across the factory (`lisbon`, `buenos-aires`), and has a type of its own, `normal` or
+  `urgent` (`seat_type`). The board checks only the spelling: up to 40 lower-case letters,
+  with single hyphens between words. Which seats there are, and at which stage each sits,
+  is the dispatcher's to know (the factory definition); the board neither checks that a
+  name is a real capital nor that the seat is at the item's stage. A seat is a name on the
+  claim and nothing else: no token and no tier belongs to it. The board holds two rules: an
+  urgent seat takes an urgent item only (a normal seat takes either), and one running claim
+  sits in a seat at a time (a claim that ran out keeps its seat until `list_claimable`
+  counts the expiry). A seat that is taken is refused like an item that is held. A claim
+  made before the migration has neither a seat nor a type.
 - `claim` takes the issue's current staleness hash for an `assess` item (it is stamped as
   `input_hash`) and for a `work` item that carries one: when they differ, the item closes as
   superseded (`{"cause": "stale"}`), the answer's status is `stale`, and nothing is claimed.
@@ -224,8 +227,8 @@ check the caller; no tier may write the claim columns or the counters.
   decision's first option, "try again", lets the item go for two more runs. Any other close
   of the decision (its second option, the operator's own text, a reject, a reply) closes the
   item as superseded; `answer` names it under `also_closed`.
-- `get_item` shows a stage item's `claims`: each run, its seat, when it claimed, and how
-  the claim ended (`closed`, `released` with its reason, `expired`).
+- `get_item` shows a stage item's `claims`: each run, its seat and the seat's type, when it
+  claimed, and how the claim ended (`closed`, `released` with its reason, `expired`).
 
 ### What the board does by itself
 

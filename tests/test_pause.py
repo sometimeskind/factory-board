@@ -247,12 +247,12 @@ async def test_a_claim_is_refused_while_paused_but_for_health_and_digest(
     await store.set_pause(RECONCILER, WHY)
 
     # Urgent or not, and the item is left as it was.
-    for item, run, seat in (
-        (review, "20260101-review-01", "review/1"),
-        (bumped, "20260101-deploy-check-01", "deploy-check/urgent-1"),
+    for item, run, seat_type in (
+        (review, "20260101-review-01", "normal"),
+        (bumped, "20260101-deploy-check-01", "urgent"),
     ):
         with pytest.raises(Paused, match="the factory is paused"):
-            await store.claim_item(DISPATCHER, item.id, run, 30, seat=seat)
+            await store.claim_item(DISPATCHER, item.id, run, 30, seat="tokyo", seat_type=seat_type)
         assert await store.get_item(OPERATOR, item.id) == item
     with pytest.raises(ToolError, match="the factory is paused"):
         await board.call(
@@ -261,12 +261,17 @@ async def test_a_claim_is_refused_while_paused_but_for_health_and_digest(
             item_id=review.id,
             run_id="20260101-review-01",
             cap_minutes=30,
-            seat="review/1",
+            seat="tokyo",
+            seat_type="normal",
         )
     assert await store.list_claims(OPERATOR, review.id) == []
 
-    await store.claim_item(DISPATCHER, health.id, "20260101-health-01", 30, seat="health/1")
-    await store.claim_item(DISPATCHER, digest.id, "20260101-digest-01", 30, seat="digest/1")
+    await store.claim_item(
+        DISPATCHER, health.id, "20260101-health-01", 30, seat="lisbon", seat_type="normal"
+    )
+    await store.claim_item(
+        DISPATCHER, digest.id, "20260101-digest-01", 30, seat="athens", seat_type="normal"
+    )
     # A run that is going is not stopped: it closes its item under the pause.
     health_run = Caller(Tier.AGENT, "run:20260101-health-01")
     await store.close_item(health_run, health.id, Resolution.DONE, {"findings": []})
@@ -274,7 +279,7 @@ async def test_a_claim_is_refused_while_paused_but_for_health_and_digest(
     await store.lift_pause(OPERATOR)
     # The refused run never claimed, so its ID is still free.
     claimed = await store.claim_item(
-        DISPATCHER, review.id, "20260101-review-01", 30, seat="review/1"
+        DISPATCHER, review.id, "20260101-review-01", 30, seat="tokyo", seat_type="normal"
     )
     assert not claimed.stale
 

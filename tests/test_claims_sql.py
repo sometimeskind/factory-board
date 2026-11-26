@@ -44,7 +44,7 @@ RUN_ID = RUN.identity.partition(":")[2]
 EVERY_TIER = [OPERATOR, SESSION, DISPATCHER]
 NOT_THE_DISPATCHER = [NIGHTLY, RECONCILER, SESSION, RUN, OPERATOR]
 
-CLAIM = "SELECT claim_item(%s, %s, %s, %s, %s, %s)"
+CLAIM = "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)"
 RELEASE = "SELECT release_claim(%s, %s, %s)"
 EXPIRE = "SELECT * FROM expire_claims(%s)"
 TOKEN = "SELECT * FROM run_of_token(%s)"
@@ -83,12 +83,12 @@ def claim(
     cap: int = 30,
     current_hash: str | None = None,
     seat: str | None = None,
+    seat_type: str = "normal",
 ) -> str:
-    """Claim as the dispatcher, from a free seat at the item's stage unless one is given;
-    the function's answer."""
+    """Claim as the dispatcher, from a free seat unless one is given; the function's answer."""
     with as_tier(app_url, DISPATCHER) as conn:
         row = conn.execute(
-            CLAIM, (item_id, run, cap, sha(run), current_hash, seat or free_seat(conn, item_id))
+            CLAIM, (item_id, run, cap, sha(run), current_hash, seat or free_seat(conn), seat_type)
         ).fetchone()
     assert row is not None
     return row[0]
@@ -176,7 +176,7 @@ def test_only_the_dispatcher_claims_and_counts_expiries(
 ) -> None:
     before = row_of(owner, item)
     with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
-        conn.execute(CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "review/1"))
+        conn.execute(CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "lisbon", "normal"))
     with pytest.raises(errors.InsufficientPrivilege), as_tier(app_url, caller) as conn:
         conn.execute(EXPIRE, (OPERATOR.identity,))
     assert row_of(owner, item) == before
@@ -188,7 +188,7 @@ def test_a_process_whose_actor_is_not_the_dispatcher_claims_nothing(
     app_url: str, item: str, actor: str | None
 ) -> None:
     for statement, arguments in (
-        (CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "review/1")),
+        (CLAIM, (item, "20260101-review-01", 30, sha("t"), None, "lisbon", "normal")),
         (EXPIRE, (OPERATOR.identity,)),
         (RELEASE, (item, "stopped", None)),
     ):
@@ -316,7 +316,7 @@ def test_the_claims_table_is_forced_under_row_security(owner: psycopg.Connection
         "WHERE table_name = 'claims' AND grantee <> 'board_owner' "
         "GROUP BY grantee, privilege_type ORDER BY grantee"
     ).fetchall()
-    readable = "claimed_at,decision_id,ended_at,ending,expires_at,item_id,reason,run,seat"
+    readable = "claimed_at,decision_id,ended_at,ending,expires_at,item_id,reason,run,seat,seat_type"
     assert grants == [
         ("board_agent", "SELECT", readable),
         ("board_operator", "SELECT", readable),
@@ -488,13 +488,26 @@ def test_a_run_claims_once(app_url: str, owner: psycopg.Connection, item: str) -
     with pytest.raises(errors.UniqueViolation), as_tier(app_url, DISPATCHER) as conn:
         conn.execute(
             CLAIM,
-            (OTHER, "20260101-review-02", 30, sha("20260101-review-01"), None, "work/1"),
+            (OTHER, "20260101-review-02", 30, sha("20260101-review-01"), None, "oslo", "normal"),
         )
     assert state(owner, OTHER) == (None, None, 0, 0, True)
 
 
-GOOD = ("20260101-review-01", 30, "a" * 64, None, "review/1")
-BAD_SEATS = (None, "", "review", "review/0", "review/100", "Review/1", "review/urgent", "/1")
+GOOD = ("20260101-review-01", 30, "a" * 64, None, "lisbon", "normal")
+BAD_SEATS = (
+    None,
+    "",
+    "work/1",
+    "review/urgent-1",
+    "Lisbon",
+    "lisbon1",
+    "-lisbon",
+    "lisbon-",
+    "buenos--aires",
+    "buenos aires",
+    "a" * 41,
+)
+BAD_SEAT_TYPES = (None, "", "Normal", "urgent-1", "vip")
 
 
 @pytest.mark.parametrize(
@@ -506,8 +519,9 @@ BAD_SEATS = (None, "", "review", "review/0", "review/100", "Review/1", "review/u
             (*GOOD[:2], token, *GOOD[3:])
             for token in (None, "", "abc", "A" * 64, "a" * 65, "g" * 64)
         ],
-        *[(*GOOD[:3], current, GOOD[4]) for current in ("", "has space", "h\n", "x" * 129)],
-        *[(*GOOD[:4], seat) for seat in BAD_SEATS],
+        *[(*GOOD[:3], current, *GOOD[4:]) for current in ("", "has space", "h\n", "x" * 129)],
+        *[(*GOOD[:4], seat, GOOD[5]) for seat in BAD_SEATS],
+        *[(*GOOD[:5], seat_type) for seat_type in BAD_SEAT_TYPES],
     ],
 )
 def test_a_claim_with_a_bad_value_is_refused(
@@ -518,6 +532,40 @@ def test_a_claim_with_a_bad_value_is_refused(
         conn.execute(CLAIM, (item, *arguments))
     assert row_of(owner, item) == before
     assert owner.execute("SELECT count(*) FROM claims").fetchone() == (0,)
+
+
+def test_an_urgent_seat_takes_an_urgent_item_only(
+    app_url: str, owner: psycopg.Connection, item: str
+) -> None:
+    with pytest.raises(errors.CheckViolation, match="seat lisbon is for an urgent item"):
+        claim(app_url, item, "20260101-review-01", seat="lisbon", seat_type="urgent")
+    assert state(owner, item) == (None, None, 0, 0, True)
+    owner.execute("UPDATE items SET urgent = true WHERE id = %s", (item,))
+    assert claim(app_url, item, "20260101-review-01", seat="lisbon", seat_type="urgent") == (
+        "claimed"
+    )
+    rows = owner.execute("SELECT seat, seat_type FROM claims").fetchall()
+    assert rows == [("lisbon", "urgent")]
+
+
+def test_a_claim_s_seat_and_its_type_are_checked_in_the_table(
+    app_url: str, owner: psycopg.Connection, item: str
+) -> None:
+    claim(app_url, item, "20260101-review-01", seat="buenos-aires")
+    for change in (
+        "UPDATE claims SET seat_type = 'vip'",
+        "UPDATE claims SET seat_type = NULL",
+        "UPDATE claims SET seat = NULL",
+        "UPDATE claims SET seat = 'review/1'",
+        "UPDATE claims SET seat = repeat('a', 41)",
+    ):
+        with pytest.raises(errors.CheckViolation), owner.transaction():
+            owner.execute(change)
+    assert owner.execute("SELECT seat, seat_type FROM claims").fetchall() == [
+        ("buenos-aires", "normal")
+    ]
+    # A claim made before claims carried a seat has neither.
+    owner.execute("UPDATE claims SET seat = NULL, seat_type = NULL")
 
 
 def test_the_longest_and_the_shortest_cap(
@@ -542,7 +590,9 @@ def test_two_claims_of_one_item_at_once_and_one_wins(
         try:
             with as_tier(app_url, DISPATCHER) as conn:
                 together.wait(timeout=10)
-                row = conn.execute(CLAIM, (item, run, 30, sha(run), None, seat_of(run))).fetchone()
+                row = conn.execute(
+                    CLAIM, (item, run, 30, sha(run), None, seat_of(run), "normal")
+                ).fetchone()
                 # Keep the row locked for a while, so the other one waits for it.
                 time.sleep(0.5)
         except psycopg.Error as exc:

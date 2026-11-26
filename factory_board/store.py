@@ -270,9 +270,10 @@ class Claim:
     ending: str | None
     reason: str | None
     decision_id: str | None
-    # The seat the run took: `review/1`, `review/urgent-1`. None on a claim made before
-    # claims carried one.
+    # The seat the run took, a city (`lisbon`), and its type, `normal` or `urgent`. Both
+    # None on a claim made before claims carried a seat.
     seat: str | None
+    seat_type: str | None
 
 
 @dataclass(frozen=True)
@@ -439,7 +440,7 @@ def _item(row: DictRow) -> Item:
 _CLAIM = sql.SQL(
     """
     c.run, c.item_id, i.kind AS stage, i.urgent, c.claimed_at, c.expires_at, c.ended_at,
-    c.ending, c.reason, c.decision_id, c.seat
+    c.ending, c.reason, c.decision_id, c.seat, c.seat_type
     """
 )
 
@@ -984,12 +985,13 @@ class Store:
         input_hash: str | None = None,
         *,
         seat: str,
+        seat_type: str,
     ) -> Claimed:
         """Claim an item for one run, from a seat, and mint the run's token. The
         dispatcher only.
 
-        The claim runs out ten minutes after `cap_minutes`. `seat` is a seat at the item's
-        stage that no run sits in; an urgent seat takes an urgent item only. `input_hash`
+        The claim runs out ten minutes after `cap_minutes`. `seat` is a seat no run sits
+        in, and `seat_type` its type: an urgent seat takes an urgent item only. `input_hash`
         is the issue's current staleness hash: an `assess` item is stamped with it, and a
         `work` item assessed under another one is closed as superseded instead
         (`Claimed.stale`). Raises NotClaimable for an item that is held, deferred, waiting
@@ -999,8 +1001,8 @@ class Store:
         token = new_run_token()
         async with self._as(caller) as conn:
             cur = await conn.execute(
-                "SELECT claim_item(%s, %s, %s, %s, %s, %s)",
-                (item_id, run, cap_minutes, token_sha256(token), input_hash, seat),
+                "SELECT claim_item(%s, %s, %s, %s, %s, %s, %s)",
+                (item_id, run, cap_minutes, token_sha256(token), input_hash, seat, seat_type),
             )
             outcome = await cur.fetchone()
             item = await self._fetch(conn, item_id)
