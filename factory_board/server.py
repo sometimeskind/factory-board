@@ -25,6 +25,9 @@ from starlette.responses import PlainTextResponse
 from factory_board import metrics
 from factory_board.auth import Identity
 from factory_board.kinds import (
+    RUN_CREATES,
+    RUN_RELEASES,
+    STAGE_RESULTS,
     Assess,
     AssessReason,
     ClaimHash,
@@ -44,6 +47,7 @@ from factory_board.kinds import (
     Seat,
     SeatType,
     StageItem,
+    StageResult,
     SubjectType,
     parse_operator_item,
 )
@@ -57,6 +61,7 @@ from factory_board.store import (
     Pause,
     Reply,
     Resolution,
+    RunToken,
     Store,
     StoreError,
     Subject,
@@ -86,6 +91,12 @@ itself writes an issue's assess item when the operator's last open item that hol
 closes, and when the last open deploy-check that names the issue closes. The
 dispatcher reads the queue of the stages' items, claims one for each run it starts and
 releases a claim when a run is interrupted. A tool outside the caller's tier is refused.
+
+A stage's run signs in with the token its claim returned, and has four tools. my_item reads
+the item the run holds. close_my_item closes it with the stage's result fields: that is the
+run's last act, and its token is dead from then on. release_my_item gives the item back
+where the stage allows it (a deploy-check whose change is not live yet), which ends the run
+too. create_item writes an item for the operator, of the kinds the stage may write.
 
 The operator can pause the factory (pause, with a reason) and lift the pause (resume). The
 reconciler pauses it too, when a check of its own trips; only the operator lifts a pause.
@@ -130,23 +141,27 @@ After = Annotated[
     ),
 ]
 
-# Who may call a tool. The two processes share a tier and are told apart by name.
+# Who may call a tool. The processes share a tier and are told apart by name; so do a
+# session and a stage's run.
 OPERATOR = frozenset({"operator"})
 SESSION = frozenset({"session"})
 NIGHTLY = frozenset({"nightly"})
 RECONCILER = frozenset({"reconciler"})
 DISPATCHER = frozenset({"dispatcher"})
+RUN = frozenset({"run"})
 READERS = OPERATOR | SESSION
 EVERY_READER = READERS | RECONCILER | DISPATCHER
 
 
 def who(identity: Identity) -> str:
-    """The caller's row in the tool table: `operator`, `session`, or a process's name."""
+    """The caller's row in the tool table: `operator`, `session`, `run`, or a process's
+    name."""
     caller = identity.caller
     if caller.tier is Tier.OPERATOR:
         return "operator"
     if caller.tier is Tier.AGENT:
-        return "session"
+        # A run never gets a session's tools, whatever else is known about it.
+        return "run" if caller.identity.startswith("run:") else "session"
     return caller.identity.partition(":")[2]
 
 
@@ -333,13 +348,20 @@ def _new_item(
     )
 
 
+def _own(identity: Identity) -> RunToken:
+    """The run a run's tool is called by: its item and its stage, as its token says."""
+    if identity.run is None:
+        raise ToolError("this caller's token names no run")
+    return identity.run
+
+
 def _held_by_a_person(item: Item) -> bool:
     return item.claimed_by is not None and item.claimed_by.startswith("human:")
 
 
 def build_server(
     store: Store,
-    current_identity: Callable[[], Identity],
+    current_identity: Callable[[], Awaitable[Identity]],
     operator: str,
     auth: Any = None,
 ) -> FastMCP:
@@ -351,7 +373,7 @@ def build_server(
         tool: str, callers: frozenset[str], fn: Callable[[Identity], Awaitable[T]]
     ) -> T:
         try:
-            identity = current_identity()
+            identity = await current_identity()
             if who(identity) not in callers:
                 raise ToolError(f"{tool} is not a tool of this caller's tier")
             result = await fn(identity)
@@ -645,12 +667,22 @@ def build_server(
         `holds` says whether the item's issue waits on the operator because of this item.
         Leave it true unless the issue can go on without it; false needs a ticket.
 
+        A stage's run writes only the kinds its stage may: a deploy-check run a decision.
+
         """
 
         async def run(identity: Identity) -> dict[str, Any]:
+            if who(identity) == "run":
+                stage = _own(identity).stage
+                allowed = RUN_CREATES.get(stage, frozenset())
+                if item.kind not in allowed:
+                    raise ToolError(
+                        f"a {stage} run writes "
+                        f"{' or '.join(sorted(allowed)) or 'no'} items, not a {item.kind} item"
+                    )
             return await create("create", identity, item, key, operator_identity, after, holds)
 
-        return await call("create_item", SESSION, run)
+        return await call("create_item", SESSION | RUN, run)
 
     create_item.__doc__ = f"{create_item.__doc__}{CONTENT_RULE}"
 
@@ -1015,6 +1047,102 @@ def build_server(
 
         return await call("release", DISPATCHER, run)
 
+    # ---- a stage's run ----
+
+    async def my_item() -> dict[str, Any]:
+        """The item this run holds, as get_item shows it: its inputs under `fields`, the
+        operator's replies on it, and the runs that claimed it."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            held = _own(identity).item_id
+            item = await store.get_item(identity.caller, held)
+            return view(
+                item,
+                await store.list_replies(identity.caller, held),
+                await store.list_claims(identity.caller, held),
+            )
+
+        return await call("my_item", RUN, run)
+
+    async def close_my_item(result: StageResult) -> dict[str, Any]:
+        """Close the item this run holds, with its stage's result fields. It is the run's
+        last act: the token is dead once the item is closed, and a closed item stays
+        closed.
+
+        A deploy-check closes as healthy or unhealthy with what it took as live (an
+        Application's synced revision, or the image a workload runs) and where to look.
+        A change that is not live yet is no result: release the item until a later time
+        with release_my_item. A change still not live a day after the merge closes as
+        stuck, with the decision item written for the operator first (create_item).
+
+        """
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            own = _own(identity)
+            model = STAGE_RESULTS.get(own.stage)
+            if model is None:
+                raise ToolError(f"the board has no result fields for a {own.stage} run yet")
+            if model is not type(result):
+                raise ToolError(f"a {own.stage} run closes with a {own.stage} result")
+            if result.decision is not None:
+                decision = await store.get_item(identity.caller, result.decision)
+                if decision.kind != "decision" or decision.created_by != identity.caller.identity:
+                    raise ToolError(f"item {result.decision} is not a decision item this run wrote")
+            closed = await store.close_item(
+                identity.caller, own.item_id, Resolution.DONE, result.model_dump(mode="json")
+            )
+            record("close", closed, identity)
+            return {
+                "status": "closed",
+                "confirmation": _confirmation(closed),
+                "item": view(closed),
+                "note": "The run is over: its token is dead.",
+            }
+
+        return await call("close_my_item", RUN, run)
+
+    close_my_item.__doc__ = f"{close_my_item.__doc__}{CONTENT_RULE}"
+
+    async def release_my_item(
+        reason: ReleaseReason,
+        not_before: Annotated[
+            datetime | None,
+            Field(
+                description="when the item returns to the queue, at most a day ahead, with "
+                "its UTC offset: needed with not-live"
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """Give the item this run holds back, unfinished, for a reason its stage may give.
+        A deploy-check whose change is not live yet releases with not-live and the time to
+        look again (30 minutes on). The release is counted on the item and is not an
+        expiry. It ends the run: the token is dead once the item is released."""
+
+        async def run(identity: Identity) -> dict[str, Any]:
+            own = _own(identity)
+            allowed = RUN_RELEASES.get(own.stage, frozenset())
+            if reason not in allowed:
+                names = " or ".join(sorted(one.value for one in allowed))
+                raise ToolError(
+                    f"a {own.stage} run releases its item with {names}, not {reason.value}"
+                    if allowed
+                    else f"a {own.stage} run does not release its item: it closes it"
+                )
+            if reason is ReleaseReason.NOT_LIVE and not_before is None:
+                raise ToolError("not-live needs not_before: when to look again")
+            if not_before is not None and not_before.tzinfo is None:
+                raise ToolError("not_before needs a UTC offset, e.g. 2026-01-31T08:00:00+00:00")
+            item = await store.release_claim(identity.caller, own.item_id, reason.value, not_before)
+            record("release", item, identity)
+            return {
+                "status": "released",
+                "confirmation": _confirmation(item),
+                "item": view(item),
+                "note": "The run is over: its token is dead.",
+            }
+
+        return await call("release_my_item", RUN, run)
+
     read_only = {"readOnlyHint": True}
     write = {"destructiveHint": False}
     final = {"destructiveHint": True}
@@ -1031,6 +1159,9 @@ def build_server(
         (list_claimable, write),
         (claim, write),
         (release, write),
+        (my_item, read_only),
+        (close_my_item, final),
+        (release_my_item, write),
         (pause, write),
         (resume, write),
         (done, final),

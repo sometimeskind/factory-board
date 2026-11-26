@@ -1,6 +1,6 @@
 """Who is calling, and at which tier.
 
-Five ways in, and the tier belongs to the token:
+Six ways in, and the tier belongs to the token:
 
 - **The operator** signs in through FastMCP's OIDCProxy in front of Pocket ID (claude.ai).
   A user in the operator group is `human:<username>` at the operator tier.
@@ -12,11 +12,15 @@ Five ways in, and the tier belongs to the token:
 - **The dispatcher token** is `process:dispatcher` at the process tier. The three processes
   share a tier and not their tools: the server tells them apart by identity.
 
-A run's token, which the board mints at a claim, is not accepted here yet: that comes with
-the stages that hold one.
+- **A run's token**, which the board mints at a claim and returns once, is `run:<id>` at
+  the agent tier, with the item it holds and its stage. The board keeps only its SHA-256,
+  and the database says whose it is while the claim runs: the token is dead once the item
+  closes or the claim is released or runs out. Any coding harness can hold one: it is a
+  plain bearer token.
 
 A static token is accepted only when its SHA-256 matches the configured hash *and* the
 route header (set by the private HTTPRoute, overwriting the client's) is exactly `private`.
+A run's token is looked up on the private route only: off it, it is an unknown token.
 
 All of it is checked again on every tool call, not only at the HTTP layer. Nothing here
 reads a tool's input: the caller, and whether the operator typed into its run, come from
@@ -29,7 +33,7 @@ import hashlib
 import hmac
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,7 +43,7 @@ from fastmcp.server.dependencies import get_access_token, get_http_request
 
 from factory_board import metrics
 from factory_board.config import ServerSettings
-from factory_board.store import Caller, Tier
+from factory_board.store import Caller, RunToken, Tier
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +51,8 @@ SESSION = "session"
 NIGHTLY = "nightly"
 RECONCILER = "reconciler"
 DISPATCHER = "dispatcher"
+# The client name of a run's token: no configured token's, since a run's is minted.
+RUN = "run"
 
 # The header an interactive session names itself with.
 SESSION_HEADER = "X-Factory-Board-Session"
@@ -68,20 +74,25 @@ class Identity:
     caller: Caller
     # The operator typed into the run that is calling: true for an interactive session.
     operator_typed: bool
+    # For a stage's run: the run, the item it holds and its stage, as its token says.
+    run: RunToken | None = None
 
 
 class StaticTokens(TokenVerifier):
-    """The session, nightly, reconciler and dispatcher tokens, on the private route only."""
+    """The session, nightly, reconciler and dispatcher tokens, and with `run_for_token` the
+    runs' tokens, on the private route only."""
 
     def __init__(
         self,
         sha256_by_name: Mapping[str, str],
         route_header: str,
         required_scopes: list[str] | None = None,
+        run_for_token: Callable[[str], Awaitable[RunToken | None]] | None = None,
     ) -> None:
         super().__init__(required_scopes=required_scopes)
         self._sha256_by_name = {name: sha.lower() for name, sha in sha256_by_name.items()}
         self._route_header = route_header
+        self._run_for_token = run_for_token
 
     def _named(self, token: str) -> str | None:
         digest = hashlib.sha256(token.encode()).hexdigest()
@@ -116,17 +127,30 @@ class StaticTokens(TokenVerifier):
             return None
         return name
 
+    async def run_of(self, token: str) -> RunToken | None:
+        """The run whose token this is, while its claim runs; None for any other token, and
+        for every token off the private route. A configured token is never a run's."""
+        if self._run_for_token is None or self._named(token) is not None:
+            return None
+        if not self._on_private_route():
+            return None
+        return await self._run_for_token(token)
+
     async def verify_token(self, token: str) -> AccessToken | None:
         name = self.accepts(token)
+        subject = name
         if name is None:
-            return None
+            run = await self.run_of(token)
+            if run is None:
+                return None
+            name, subject = RUN, f"run:{run.run}"
         return AccessToken(
             token=token,
             client_id=name,
             # The HTTP layer enforces the server's required scopes on every token.
             scopes=list(self.required_scopes),
             expires_at=None,
-            claims={"sub": name},
+            claims={"sub": subject},
         )
 
 
@@ -137,10 +161,17 @@ def postgres_store(pool: Any) -> Any:
     return PostgreSQLStore(pool=pool, table_name="oauth_proxy_kv", auto_create=False)
 
 
-def build_auth(settings: ServerSettings, key_value: Any) -> tuple[Any, StaticTokens | None]:
+def build_auth(
+    settings: ServerSettings,
+    key_value: Any,
+    run_for_token: Callable[[str], Awaitable[RunToken | None]] | None = None,
+) -> tuple[Any, StaticTokens | None]:
     """OIDCProxy in front of Pocket ID, its state Fernet-encrypted in `key_value`
-    (postgres_store in production), plus the static tokens that are configured.
-    Returns (auth, static verifier)."""
+    (postgres_store in production), plus the static tokens that are configured and, with
+    `run_for_token` (the store's), the runs' tokens. Returns (auth, static verifier).
+
+    The runs' tokens are accepted only where a static token is configured: a board with
+    none has no dispatcher to claim for a run."""
     from cryptography.fernet import Fernet
     from fastmcp.server.auth import MultiAuth
     from fastmcp.server.auth.oidc_proxy import OIDCProxy
@@ -179,7 +210,7 @@ def build_auth(settings: ServerSettings, key_value: Any) -> tuple[Any, StaticTok
     }
     if not hashes:
         return proxy, None
-    static = StaticTokens(hashes, settings.route_header, proxy.required_scopes)
+    static = StaticTokens(hashes, settings.route_header, proxy.required_scopes, run_for_token)
     return MultiAuth(server=proxy, verifiers={"static": static}), static
 
 
@@ -196,10 +227,13 @@ def _session_identity() -> Identity:
     return Identity(Caller(Tier.AGENT, f"session:{values[0]}"), operator_typed=True)
 
 
-def identity_resolver(operator_group: str, static: StaticTokens | None) -> Callable[[], Identity]:
-    """The per-call identity check every tool runs before it touches the store."""
+def identity_resolver(
+    operator_group: str, static: StaticTokens | None
+) -> Callable[[], Awaitable[Identity]]:
+    """The per-call identity check every tool runs before it touches the store. A run's
+    token is looked up again here, so a call made after its claim ended is refused."""
 
-    def resolve() -> Identity:
+    async def resolve() -> Identity:
         token = get_access_token()
         if token is None:
             raise ToolError("not signed in")
@@ -213,6 +247,9 @@ def identity_resolver(operator_group: str, static: StaticTokens | None) -> Calla
                 return Identity(Caller(Tier.PROCESS, RECONCILER_IDENTITY), operator_typed=False)
             if name == DISPATCHER:
                 return Identity(Caller(Tier.PROCESS, DISPATCHER_IDENTITY), operator_typed=False)
+            run = await static.run_of(token.token)
+            if run is not None:
+                return Identity(Caller(Tier.AGENT, f"run:{run.run}"), operator_typed=False, run=run)
         claims = token.claims or {}
         groups = claims.get("groups")
         if not isinstance(groups, list) or operator_group not in groups:

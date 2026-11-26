@@ -41,7 +41,10 @@ class Board:
 
     def __init__(self, store: Store) -> None:
         self.identity = AS_SESSION
-        self.server = build_server(store, lambda: self.identity, "operator")
+        self.server = build_server(store, self.who, "operator")
+
+    async def who(self) -> Identity:
+        return self.identity
 
     async def call(self, identity: Identity, tool: str, **arguments: Any) -> dict[str, Any]:
         self.identity = identity
