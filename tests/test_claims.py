@@ -273,6 +273,35 @@ async def test_a_release_gives_the_item_back(store: Store) -> None:
     assert (await store.get_item(OPERATOR, item.id)).claimed_by == "run:20260101-review-02"
 
 
+async def test_two_refused_results_write_a_decision_held_by_the_person_named(
+    store: Store,
+) -> None:
+    item = released = await review(store)
+    for count, run in enumerate(("20260101-review-01", "20260101-review-02"), start=1):
+        await store.claim_item(DISPATCHER, item.id, run, 30, seat=seat_of(run), seat_type="normal")
+        if count == 1:
+            with pytest.raises(InvalidItem, match="held by a person"):
+                await store.release_claim(DISPATCHER, item.id, "result-refused")
+        released = await store.release_claim(
+            DISPATCHER, item.id, "result-refused", holder=OPERATOR.identity
+        )
+        assert (released.releases, released.expiries, released.claimed_by) == (count, 0, None)
+    assert len(released.after) == 1
+    decision = await store.get_item(OPERATOR, released.after[0])
+    assert (decision.kind, decision.claimed_by, decision.created_by) == (
+        "decision",
+        OPERATOR.identity,
+        DISPATCHER.identity,
+    )
+    assert released.waiting_on == (decision.id,)
+    claims = await store.list_claims(OPERATOR, item.id)
+    assert [(c.ending, c.reason, c.decision_id) for c in claims] == [
+        ("released", "result-refused", decision.id),
+        ("released", "result-refused", decision.id),
+    ]
+    assert await store.list_claimable(DISPATCHER) == []
+
+
 async def test_a_run_releases_its_own_claim_and_no_other(store: Store) -> None:
     item = await review(store)
     await store.claim_item(DISPATCHER, item.id, RUN_ID, 30, seat="tokyo", seat_type="normal")

@@ -825,7 +825,8 @@ class Store:
 
     async def list_cascaded(self, caller: Caller, item_id: str) -> list[Item]:
         """The items that closed because this one was rejected or replied to, or because a
-        two-expiry decision was answered with anything but "try again"; oldest first.
+        decision written after two failed runs was answered with anything but "try again";
+        oldest first.
 
         A closer writes its own result, so the result alone proves nothing: the cascade's
         items also closed in the transaction that closed this one, at the same moment.
@@ -1013,16 +1014,24 @@ class Store:
         return Claimed(item, token if outcome == ("claimed",) else None)
 
     async def release_claim(
-        self, caller: Caller, item_id: str, reason: str, not_before: datetime | None = None
+        self,
+        caller: Caller,
+        item_id: str,
+        reason: str,
+        not_before: datetime | None = None,
+        holder: str | None = None,
     ) -> Item:
         """Give a run's claim back: the item returns to the queue, with one more release.
 
         The dispatcher, for any run; a run, for its own claim. `not_before` is for a
-        `deploy-check` only: the time it returns to the queue.
+        `deploy-check` only: the time it returns to the queue. A `result-refused` release
+        counts toward the decision item as an expiry does, and needs `holder`, the person
+        the decision is for: the second failed run in a row writes it, and the item then
+        waits on it.
         """
         async with self._as(caller) as conn:
             cur = await conn.execute(
-                "SELECT release_claim(%s, %s, %s)", (item_id, reason, not_before)
+                "SELECT release_claim(%s, %s, %s, %s)", (item_id, reason, not_before, holder)
             )
             if await cur.fetchone() != (True,):
                 raise ItemNotFound(f"no item {item_id}")
@@ -1032,7 +1041,8 @@ class Store:
 
     async def expire_claims(self, caller: Caller, holder: str) -> list[Expired]:
         """Count the claims that ran out: each item is open and unclaimed again. The
-        dispatcher only. Two in a row on one item write a decision item, held by `holder`."""
+        dispatcher only. Two failed runs in a row on one item (an expiry or a `result-refused`
+        release each) write a decision item, held by `holder`."""
         async with self._as(caller) as conn:
             cur = await conn.execute("SELECT * FROM expire_claims(%s)", (holder,))
             return [Expired(*row) for row in await cur.fetchall()]

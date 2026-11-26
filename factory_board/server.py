@@ -560,7 +560,7 @@ def build_server(
                 result = {"answer": text}
             closed = await store.close_item(identity.caller, item_id, Resolution.ANSWERED, result)
             record("answer", closed, identity)
-            # A decision written after two expired claims closes its item with it, unless
+            # A decision written after two failed runs closes its item with it, unless
             # the first option ("try again") was chosen.
             also = await store.list_cascaded(identity.caller, closed.id)
             for item in also:
@@ -935,12 +935,12 @@ def build_server(
 
     async def list_claimable() -> dict[str, Any]:
         """The queue, in the order to take it: first the claims that ran out are counted
-        (`expired`, each with the decision item written when it was the second in a row),
-        then `items` lists every stage's item a run may be started on, with its rank (1 is
-        anything urgent, then health, digest, review, deploy-check, assess, work, retro) and
-        the oldest first within a rank. `last_claims` are the two claims made last, newest
-        first, for the rule that alternates assess and work. `running` are the claims
-        that have not ended, each with its seat and the seat's type: those seats are taken.
+        (`expired`, each with the decision item written when it was the second failed run
+        in a row), then `items` lists every stage's item a run may be started on, with its
+        rank (1 is anything urgent, then health, digest, review, deploy-check, assess, work,
+        retro) and the oldest first within a rank. `last_claims` are the two claims made
+        last, newest first, for the rule that alternates assess and work. `running` are the
+        claims that have not ended, each with its seat and the seat's type: those seats are taken.
         `paused` is the pause that stands (since, by, reason) or null: while it does, start
         only health and digest; a claim of anything else is refused."""
 
@@ -1042,13 +1042,19 @@ def build_server(
         ] = None,
     ) -> dict[str, Any]:
         """Give a run's claim back after a known interruption: the item returns to the queue
-        at once, the release is counted on it, and it does not count as an expiry. A claim
-        that has already run out is not released; it expires."""
+        at once and the release is counted on it. A claim that has already run out is not
+        released; it expires. No reason counts as an expiry but result-refused, for a run
+        whose result can't be accepted (refused on close, failing the schema check, or not
+        collected): the second failed run in a row, expired or refused, writes the decision
+        item for the operator, and the item's `after` names it."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             if not_before is not None and not_before.tzinfo is None:
                 raise ToolError("not_before needs a UTC offset, e.g. 2026-01-31T08:00:00+00:00")
-            item = await store.release_claim(identity.caller, item_id, reason.value, not_before)
+            holder = operator_identity if reason is ReleaseReason.RESULT_REFUSED else None
+            item = await store.release_claim(
+                identity.caller, item_id, reason.value, not_before, holder
+            )
             record("release", item, identity)
             return {"status": "released", "confirmation": _confirmation(item), "item": view(item)}
 

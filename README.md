@@ -224,17 +224,23 @@ check the caller; no tier may write the claim columns or the counters.
   `input_hash`) and for a `work` item that carries one: when they differ, the item closes as
   superseded (`{"cause": "stale"}`), the answer's status is `stale`, and nothing is claimed.
 - `release` gives a claim back with a reason (`start-failed`, `infra-window`, `usage-limit`,
-  `stopped`, `not-live`). The item returns to the queue at once and `releases` goes up; a
-  `deploy-check` may name a `not_before`, at most a day ahead. In the database a run may
-  release its own claim too.
+  `stopped`, `not-live`, `result-refused`). The item returns to the queue at once and
+  `releases` goes up; a `deploy-check` may name a `not_before`, at most a day ahead. In the
+  database a run may release its own claim too.
+- `result-refused` is the runner's, for a run whose result can't be accepted: the board
+  refused it on close, it failed the schema check, or what the run left could not be
+  collected. It is still a release (`releases` goes up, `expiries` does not), and it counts
+  toward the decision item below as an expiry does. No other reason counts.
 - A claim that runs out leaves the item open and unclaimed, with `expiries` one up. A run
   whose claim has run out can no longer close its item, counted or not.
-- **Two expiries in a row** on one item (releases in between are skipped) write a `decision`
-  item for the operator, about the item's subject and urgent if the item is. The item waits
-  on it (the one edge the board writes after an item exists), so it is in no queue. The
-  decision's first option, "try again", lets the item go for two more runs. Any other close
-  of the decision (its second option, the operator's own text, a reject, a reply) closes the
-  item as superseded; `answer` names it under `also_closed`.
+- **Two failed runs in a row** on one item, each an expiry or a `result-refused` release
+  (other releases in between are skipped), write a `decision` item for the operator, about
+  the item's subject and urgent if the item is. Its summary says how each run failed (ran
+  out of time, or left no result that could be accepted). The item waits on it (the one
+  edge the board writes after an item exists), so it is in no queue. The decision's first
+  option, "try again", lets the item go for two more runs. Any other close of the decision
+  (its second option, the operator's own text, a reject, a reply) closes the item as
+  superseded; `answer` names it under `also_closed`.
 - `get_item` shows a stage item's `claims`: each run, its seat and the seat's type, when it
   claimed, and how the claim ended (`closed`, `released` with its reason, `expired`).
 
@@ -296,7 +302,7 @@ written urgent and an open one becomes urgent. No wake makes an urgent item ordi
   the open one. It is not in `list_assessments`, which is per issue, and names no issue for
   `operator_acts`.
 - An item with `holds` false wakes nothing and keeps nothing waiting.
-- The decision written after two expired claims wakes nothing when it is answered with
+- The decision written after two failed runs wakes nothing when it is answered with
   "try again", and nothing when its item is the issue's own `assess` item.
 - A reject of a stage's item other than a `deploy-check` wakes nothing, and neither does a
   reply that leaves its item open.
@@ -316,7 +322,7 @@ hash covers the issue's text and not the board's items, so nothing else would no
   urgency is not carried: its run dealt with it.
 - When the item goes back to the queue instead (its claim is released or runs out), the
   pending reasons move into its `reasons`, and a pending urgency makes it urgent.
-- An item that waits on the decision after two expired claims is held by no run, so a wake
+- An item that waits on the decision after two failed runs is held by no run, so a wake
   merges into it as into any open item, and goes with it if the operator stops it.
 - The reconciler's own trigger on a held item is still dropped (`merge_assess_trigger`):
   its facts are on GitHub, where the next pass reads them again.

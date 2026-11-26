@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import psycopg
 import pytest
+from helpers import DISPATCHER, OPERATOR, as_tier, free_seat, insert_stage_row
 
 from factory_board.config import DEFAULT_MIGRATIONS_DIR
 from factory_board.migrate import MigrationError, apply_migrations, discover
@@ -179,3 +181,50 @@ def test_shipped_migrations_name_a_missing_role(owner_url: str, conn: psycopg.Co
     assert "dev/roles.sql" in message
     assert not table_exists(conn, "items")
     assert applied(conn) == []
+
+
+def test_0014_applies_on_a_database_at_0013(
+    owner_url: str, app_url: str, tmp_path: Path, conn: psycopg.Connection
+) -> None:
+    """A board with claims behind it, a counted expiry among them, takes 0014: that expiry
+    and a refused result after it write the decision."""
+    for path in sorted(DEFAULT_MIGRATIONS_DIR.glob("*.sql")):
+        if int(path.name[:4]) <= 13:
+            write(tmp_path, path.name, path.read_text())
+    assert apply_migrations(owner_url, tmp_path)[-1] == "0013_urgent_assess"
+    insert_stage_row(conn, "aaaaaaaa", assignee="review", subject_type="pr", subject_ref="202")
+
+    def claim(run: str) -> None:
+        with as_tier(app_url, DISPATCHER) as tier:
+            tier.execute(
+                "SELECT claim_item(%s, %s, 30, %s, NULL, %s, 'normal')",
+                ("aaaaaaaa", run, hashlib.sha256(run.encode()).hexdigest(), free_seat(tier)),
+            )
+
+    claim("20260101-review-01")
+    conn.execute("UPDATE items SET claim_expires = now() - interval '1 minute'")
+    conn.execute("UPDATE claims SET expires_at = now() - interval '1 minute'")
+    with as_tier(app_url, DISPATCHER) as tier:
+        tier.execute("SELECT * FROM expire_claims(%s)", (OPERATOR.identity,))
+    claim("20260101-review-02")
+    # At 0013 the release takes three arguments, and a refused result counts nowhere.
+    with as_tier(app_url, DISPATCHER) as tier:
+        tier.execute("SELECT release_claim('aaaaaaaa', 'stopped', NULL)")
+    claim("20260101-review-03")
+
+    assert apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR) == ["0014_result_refused"]
+    with as_tier(app_url, DISPATCHER) as tier:
+        tier.execute(
+            "SELECT release_claim('aaaaaaaa', 'result-refused', NULL, %s)", (OPERATOR.identity,)
+        )
+    rows = conn.execute(
+        "SELECT run, ending, reason, decision_id FROM claims ORDER BY claimed_at, run"
+    ).fetchall()
+    decision = rows[0][3]
+    assert decision is not None
+    assert rows == [
+        ("20260101-review-01", "expired", None, decision),
+        ("20260101-review-02", "released", "stopped", None),
+        ("20260101-review-03", "released", "result-refused", decision),
+    ]
+    assert conn.execute("SELECT * FROM item_after").fetchall() == [("aaaaaaaa", decision)]

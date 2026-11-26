@@ -1063,11 +1063,19 @@ async def test_a_stale_work_item_is_closed_and_nothing_is_claimed(
     assert "token" in claimed
 
 
-async def test_a_release_takes_one_of_five_reasons(
+async def test_a_release_takes_one_of_six_reasons(
     board: Board, caplog: pytest.LogCaptureFixture
 ) -> None:
     item_id = await staged(board, REVIEW)
-    reasons = ["start-failed", "infra-window", "usage-limit", "stopped", "not-live"]
+    # One result-refused alone writes no decision: the item is back in the queue like this.
+    reasons = [
+        "start-failed",
+        "infra-window",
+        "usage-limit",
+        "stopped",
+        "not-live",
+        "result-refused",
+    ]
     caplog.set_level(logging.INFO, logger="factory_board.server")
     for count, reason in enumerate(reasons, start=1):
         await claim(board, item_id, f"20260101-review-0{count}")
@@ -1081,20 +1089,20 @@ async def test_a_release_takes_one_of_five_reasons(
     assert [record.getMessage().split()[3] for record in caplog.records] == [
         "verb=claim",
         "verb=release",
-    ] * 5
+    ] * 6
 
-    await claim(board, item_id, "20260101-review-06")
+    await claim(board, item_id, "20260101-review-07")
     for bad in ("bored", "Stopped", "", "expired"):
         with pytest.raises(ToolError):
             await board.call(AS_DISPATCHER, "release", item_id=item_id, reason=bad)
     shown = await board.call(AS_OPERATOR, "get_item", item_id=item_id)
-    assert shown["held_by"] == "run:20260101-review-06"
+    assert shown["held_by"] == "run:20260101-review-07"
     assert [(c["ending"], c.get("reason")) for c in shown["claims"]] == [
         *[("released", reason) for reason in reasons],
         (None, None),
     ]
-    assert all("ended_at" in c for c in shown["claims"][:5])
-    assert "ended_at" not in shown["claims"][5]
+    assert all("ended_at" in c for c in shown["claims"][:6])
+    assert "ended_at" not in shown["claims"][6]
 
 
 async def test_a_release_of_what_no_run_holds_is_refused(board: Board, conn: Any) -> None:
@@ -1194,6 +1202,42 @@ async def test_two_expiries_in_a_row_ask_the_operator(
     }
     with pytest.raises(ToolError, match="is not claimable"):
         await claim(board, item_id, "20260101-review-03")
+
+
+async def test_an_expiry_then_a_refused_result_ask_the_operator(board: Board, conn: Any) -> None:
+    item_id = await staged(board, REVIEW)
+    assert await run_out(board, conn, item_id, "20260101-review-01") is None
+    await claim(board, item_id, "20260101-review-02")
+    released = await board.call(AS_DISPATCHER, "release", item_id=item_id, reason="result-refused")
+    assert released["status"] == "released"
+    item = released["item"]
+    assert (item["open"], item["held_by"], item["releases"], item["expiries"]) == (
+        True,
+        None,
+        1,
+        1,
+    )
+    (decision,) = item["after"]
+
+    listed = (await board.call(AS_OPERATOR, "list_items"))["items"]
+    assert [entry["id"] for entry in listed] == [decision]
+    asked = listed[0]
+    assert (asked["kind"], asked["held_by"], asked["created_by"]) == (
+        "decision",
+        OPERATOR.identity,
+        DISPATCHER.identity,
+    )
+    assert (
+        "(run 20260101-review-01 ran out of time, then run 20260101-review-02 left no result "
+        "that could be accepted)"
+    ) in asked["summary"]
+    waiting = await board.call(AS_DISPATCHER, "get_item", item_id=item_id)
+    assert waiting["waiting_on"] == [decision]
+    assert [(c["run"], c["ending"], c.get("reason"), c["decision"]) for c in waiting["claims"]] == [
+        ("20260101-review-01", "expired", None, decision),
+        ("20260101-review-02", "released", "result-refused", decision),
+    ]
+    assert (await queue(board))["items"] == []
 
 
 @pytest.mark.parametrize(

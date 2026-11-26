@@ -275,6 +275,8 @@ async def test_a_deploy_check_that_is_not_live_is_released_until_later(
         ({"reason": "not-live", "not_before": "2026-01-31T08:00:00"}, "UTC offset"),
         ({"reason": "stopped"}, "releases its item with not-live, not stopped"),
         ({"reason": "usage-limit", "not_before": later()}, "not usage-limit"),
+        # A refused result is the dispatcher's to give: the runner releases with it.
+        ({"reason": "result-refused"}, "not result-refused"),
         ({"reason": "not-live", "not_before": later(60 * 25)}, "at most a day ahead"),
     ):
         with pytest.raises(ToolError, match=message):
