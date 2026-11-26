@@ -868,7 +868,20 @@ async def test_the_queue_lists_what_ran_out_the_items_and_the_last_claims(
         ("20260101-assess-01", assess, "assess", False, None),
         ("20260101-review-01", review, "review", False, None),
     ]
-    assert set(last[0]) == {"run", "item", "stage", "urgent", "claimed_at", "expires", "ending"}
+    assert set(last[0]) == {
+        "run",
+        "item",
+        "stage",
+        "seat",
+        "urgent",
+        "claimed_at",
+        "expires",
+        "ending",
+    }
+    assert [(c["run"], c["seat"]) for c in listed["running"]] == [
+        ("20260101-review-01", "review/1"),
+        ("20260101-assess-01", "assess/1"),
+    ]
 
     # The claims that ran out are counted before the queue is read.
     lapse(conn, review)

@@ -387,6 +387,7 @@ async def test_the_metrics_show_the_queue_the_claims_and_the_limit(
         run_id="20260101-assess-01",
         cap_minutes=30,
         input_hash="hash-1",
+        seat="assess/1",
     )
     await board.call(AS_DISPATCHER, "release", item_id=written["item"]["id"], reason="infra-window")
     metrics.show(await store.stats(METRICS))
@@ -411,6 +412,7 @@ async def test_the_metrics_show_the_queue_the_claims_and_the_limit(
         run_id="20260101-assess-02",
         cap_minutes=30,
         input_hash="hash-1",
+        seat="assess/1",
     )
     metrics.show(await store.stats(METRICS))
     assert sample("factory_board_claimable_items", stage="assess", urgent="false") == 0
@@ -433,6 +435,7 @@ async def held_assess(board: Board, run_id: str = "20260101-assess-01") -> str:
         run_id=run_id,
         cap_minutes=30,
         input_hash="hash-1",
+        seat="assess/1",
     )
     return item_id
 

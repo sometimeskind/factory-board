@@ -32,5 +32,6 @@ Plain SQL, applied in order by `factory_board/migrate.py` and shipped in the ima
 | `0008_claims.sql` | The `claims` table (one row per claim, with the run token's hash); the `claimable` view, which is the queue's order; `claim_item`, `release_claim` and `expire_claims` for the dispatcher, with the decision item after two expiries in a row; `run_of_token` |
 | `0009_board_triggers.sql` | What the board does by itself: the trigger that wakes assess when the operator's last item or the last `deploy-check` on an issue closes, and `pending_reasons` for a wake that meets a held `assess` item; `operator_acts` (when the operator last acted on an issue) and the fix-forward limit that counts from it (`fix_forward`, SQLSTATE `BRD04`); the `heartbeats` table and `record_heartbeat` |
 | `0010_pause.sql` | The pause flag: the one-row `pause` table, and `set_pause` and `lift_pause` for the operator |
+| `0011_seats_and_pause.sql` | The `seat` column on `claims`, with one running claim per seat; `claim_item` takes the seat (at the item's stage, an urgent seat for an urgent item only) and refuses while the factory is paused, except a `health` or a `digest` item (SQLSTATE `BRD05`); `set_pause` accepts the reconciler |
 
 The `schema_migrations` table is created by the runner itself.

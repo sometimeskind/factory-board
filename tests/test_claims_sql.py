@@ -316,7 +316,7 @@ def test_the_claims_table_is_forced_under_row_security(owner: psycopg.Connection
         "WHERE table_name = 'claims' AND grantee <> 'board_owner' "
         "GROUP BY grantee, privilege_type ORDER BY grantee"
     ).fetchall()
-    readable = "claimed_at,decision_id,ended_at,ending,expires_at,item_id,reason,run"
+    readable = "claimed_at,decision_id,ended_at,ending,expires_at,item_id,reason,run,seat"
     assert grants == [
         ("board_agent", "SELECT", readable),
         ("board_operator", "SELECT", readable),
@@ -488,7 +488,7 @@ def test_a_run_claims_once(app_url: str, owner: psycopg.Connection, item: str) -
     with pytest.raises(errors.UniqueViolation), as_tier(app_url, DISPATCHER) as conn:
         conn.execute(
             CLAIM,
-            (OTHER, "20260101-review-02", 30, sha("20260101-review-01"), None, "review/2"),
+            (OTHER, "20260101-review-02", 30, sha("20260101-review-01"), None, "work/1"),
         )
     assert state(owner, OTHER) == (None, None, 0, 0, True)
 
