@@ -252,8 +252,8 @@ run holds.
 - `my_item` reads that item, as `get_item` shows it. A run reads no other item.
 - `close_my_item` closes it as done, with the stage's result fields as the item's `result`.
   It is the run's last act. The fields are a model per stage (`STAGE_RESULTS` in
-  `factory_board/kinds.py`); a stage without one can't close yet. Only `deploy-check` has
-  one:
+  `factory_board/kinds.py`); a stage without one can't close yet. `deploy-check` and
+  `review` have one. A deploy-check's:
 
   | Field | Holds |
   |---|---|
@@ -263,11 +263,24 @@ run holds.
   | `evidence` | 1 to 10 pointers, a line each: a log query, a pod, an Application, an alert |
   | `decision` | For `stuck` only: the `decision` item the run wrote for the operator. The board checks that this run wrote it |
 
+  A review's. The run can't write a commit status: the orchestrator writes the PR's
+  `pipeline/review` status from the closed item, on the item's `head_sha`.
+
+  | Field | Holds |
+  |---|---|
+  | `verdict` | `pass` or `block` |
+  | `block` | For a block only: `fixable` (work goes on, on the PR) or `escalate` (the operator decides) |
+  | `summary` | The reason, in a line |
+  | `checks` | Every check once (`scope`, `done-when`, `test`, `quoted-data`), each with an `outcome` (`pass`, `fail`, `not-applicable`) and a `note`, which a `fail` needs. A pass has no failed check and a block has one |
+  | `comment` | The ID of the PR comment the run wrote with the checklist result |
+  | `decision` | For an `escalate` block only: the `decision` item the run wrote. The board checks that this run wrote it |
+
 - `release_my_item` gives the item back with a reason the stage may give (`RUN_RELEASES`).
   A `deploy-check` whose change is not live yet releases with `not-live` and a `not_before`,
   at most a day ahead. The other reasons are the dispatcher's. A release ends the run too.
 - `create_item` writes an item for the operator, of the kinds the stage may write
-  (`RUN_CREATES`): a `deploy-check` run a `decision`, for a change that is stuck. The item
+  (`RUN_CREATES`): a `deploy-check` run a `decision`, for a change that is stuck, and a
+  `review` run a `decision`, for a block it escalates. The item
   is the run's (`created_by`, `created_run`) and the operator holds it.
 - This is checked in the server. In the database a run is an agent like a session: it may
   close the item it holds while its claim runs, and insert items as itself, but only items

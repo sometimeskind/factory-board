@@ -29,6 +29,7 @@ from test_server import (
     RESULT,
     REVIEW,
     TICKET,
+    WORK,
     Board,
     claim,
     lapse,
@@ -36,7 +37,7 @@ from test_server import (
 )
 
 from factory_board.auth import Identity, build_auth, identity_resolver
-from factory_board.kinds import DeployCheckResult
+from factory_board.kinds import DeployCheckResult, ReviewResult
 from factory_board.server import build_server
 from factory_board.store import Caller, RunToken, Store, Tier
 
@@ -127,6 +128,104 @@ def test_a_deploy_check_result_names_what_was_live() -> None:
 def test_a_result_that_does_not_fit_is_refused(result: dict[str, Any], message: str) -> None:
     with pytest.raises(ValidationError, match=message):
         DeployCheckResult.model_validate(result)
+
+
+# ---- a review's result ----
+
+PASSED: dict[str, Any] = {
+    "kind": "review",
+    "verdict": "pass",
+    "block": None,
+    "summary": "The diff does what the issue asks.",
+    "checks": [
+        {"check": "scope", "outcome": "pass", "note": None},
+        {"check": "done-when", "outcome": "pass", "note": None},
+        {"check": "test", "outcome": "not-applicable", "note": "Not a bug fix."},
+        {"check": "quoted-data", "outcome": "pass", "note": None},
+    ],
+    "comment": 4_000_000_001,
+    "decision": None,
+}
+
+
+def failing(check: str = "test", note: str | None = "No test fails without the fix.") -> list[Any]:
+    return [
+        c | {"outcome": "fail", "note": note} if c["check"] == check else c
+        for c in PASSED["checks"]
+    ]
+
+
+FIXABLE = PASSED | {"verdict": "block", "block": "fixable", "checks": failing()}
+ESCALATE = FIXABLE | {"block": "escalate"}
+
+
+def test_a_review_result_has_the_verdict_and_every_check() -> None:
+    assert ReviewResult.model_validate(PASSED).model_dump(mode="json") == PASSED
+    bare = {k: v for k, v in PASSED.items() if k not in ("kind", "block", "decision")}
+    assert ReviewResult.model_validate(bare).model_dump(mode="json") == PASSED
+    assert ReviewResult.model_validate(FIXABLE).block == "fixable"
+    assert ReviewResult.model_validate(ESCALATE | {"decision": "abcdefgh"}).decision == "abcdefgh"
+
+
+@pytest.mark.parametrize(
+    ("result", "message"),
+    [
+        (PASSED | {"checks": failing()}, "a pass has no failed check: test"),
+        (PASSED | {"block": "fixable"}, "for a block only"),
+        (PASSED | {"decision": "abcdefgh"}, "for a block only"),
+        (PASSED | {"verdict": "block"}, "a block needs `block`"),
+        (FIXABLE | {"checks": PASSED["checks"]}, "a block needs a failed check"),
+        (FIXABLE | {"checks": failing(note=None)}, "needs a `note`"),
+        (FIXABLE | {"decision": "abcdefgh"}, "escalate block only"),
+        (ESCALATE, "escalate needs `decision`"),
+        (PASSED | {"checks": PASSED["checks"][:3]}, "checks"),
+        (PASSED | {"checks": [*PASSED["checks"][:3], PASSED["checks"][0]]}, "every check once"),
+        (PASSED | {"comment": 0}, "comment"),
+        ({k: v for k, v in PASSED.items() if k != "comment"}, "comment"),
+        (PASSED | {"verdict": "approve"}, "verdict"),
+        (PASSED | {"summary": "two\nlines"}, "summary"),
+        (PASSED | {"outcome": "healthy"}, "outcome"),
+    ],
+)
+def test_a_review_result_that_does_not_fit_is_refused(result: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        ReviewResult.model_validate(result)
+
+
+async def test_a_review_run_closes_with_its_verdict(board: Board) -> None:
+    reviewer, item_id, _ = await running(board, REVIEW, "20260101-review-01")
+    # Another stage's result is not a review's.
+    with pytest.raises(ToolError, match="a review run closes with a review result"):
+        await board.call(reviewer, "close_my_item", result=RESULT)
+    with pytest.raises(ToolError, match="a review run does not release its item"):
+        await board.call(reviewer, "release_my_item", reason="not-live", not_before=later())
+    closed = await board.call(reviewer, "close_my_item", result=PASSED)
+    assert (closed["item"]["id"], closed["item"]["open"]) == (item_id, False)
+    assert closed["item"]["result"] == PASSED
+    # The reconciler reads the verdict and the commit it is on from the closed item.
+    shown = await board.call(AS_RECONCILER, "get_item", item_id=item_id)
+    assert (shown["fields"]["head_sha"], shown["result"]["verdict"]) == (REVIEW["head_sha"], "pass")
+
+
+async def test_an_escalated_block_names_the_decision_the_run_wrote(board: Board) -> None:
+    reviewer, _, _ = await running(board, REVIEW, "20260101-review-01")
+    with pytest.raises(ToolError, match="a review run writes decision items, not a manual"):
+        await board.call(reviewer, "create_item", item=MANUAL)
+    theirs = await board.create(DECISION)
+    with pytest.raises(ToolError, match="not a decision item this run wrote"):
+        await board.call(reviewer, "close_my_item", result=ESCALATE | {"decision": theirs})
+    mine = (await board.call(reviewer, "create_item", item=RUN_DECISION))["item"]["id"]
+    closed = await board.call(reviewer, "close_my_item", result=ESCALATE | {"decision": mine})
+    assert (closed["item"]["result"]["block"], closed["item"]["result"]["decision"]) == (
+        "escalate",
+        mine,
+    )
+
+
+async def test_a_deploy_check_run_does_not_close_with_a_review_result(board: Board) -> None:
+    run, _, _ = await running(board)
+    with pytest.raises(ToolError, match="a deploy-check run closes with a deploy-check result"):
+        await board.call(run, "close_my_item", result=PASSED)
 
 
 # ---- the run's tools ----
@@ -258,9 +357,9 @@ async def test_a_run_writes_only_the_kinds_its_stage_may(board: Board) -> None:
     run, _, _ = await running(board)
     with pytest.raises(ToolError, match="a deploy-check run writes decision items, not a manual"):
         await board.call(run, "create_item", item=MANUAL)
-    reviewer, _, _ = await running(board, REVIEW, "20260101-review-01")
-    with pytest.raises(ToolError, match="a review run writes no items, not a decision item"):
-        await board.call(reviewer, "create_item", item=DECISION)
+    worker, _, _ = await running(board, WORK, "20260101-work-01")
+    with pytest.raises(ToolError, match="a work run writes no items, not a decision item"):
+        await board.call(worker, "create_item", item=DECISION)
     assert (await board.call(AS_OPERATOR, "list_items"))["items"] == []
     # A session's create is as it was.
     assert (await board.call(AS_SESSION, "create_item", item=MANUAL))["status"] == "created"
@@ -298,16 +397,16 @@ async def test_a_deploy_check_that_is_not_live_is_released_until_later(
 
 
 async def test_a_stage_without_result_fields_neither_closes_nor_releases(board: Board) -> None:
-    reviewer, item_id, _ = await running(board, REVIEW, "20260101-review-01")
-    with pytest.raises(ToolError, match="no result fields for a review run yet"):
-        await board.call(reviewer, "close_my_item", result=RESULT)
-    with pytest.raises(ToolError, match="a review run does not release its item"):
-        await board.call(reviewer, "release_my_item", reason="not-live", not_before=later())
-    shown = await board.call(reviewer, "my_item")
+    worker, item_id, _ = await running(board, WORK, "20260101-work-01")
+    with pytest.raises(ToolError, match="no result fields for a work run yet"):
+        await board.call(worker, "close_my_item", result=RESULT)
+    with pytest.raises(ToolError, match="a work run does not release its item"):
+        await board.call(worker, "release_my_item", reason="not-live", not_before=later())
+    shown = await board.call(worker, "my_item")
     assert (shown["id"], shown["open"], shown["held_by"]) == (
         item_id,
         True,
-        run_name("20260101-review-01"),
+        run_name("20260101-work-01"),
     )
 
 
