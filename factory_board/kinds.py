@@ -161,6 +161,44 @@ class LiveBy(StrEnum):
     IMAGE = "image"
 
 
+class ReviewVerdict(StrEnum):
+    """What a review run found. The orchestrator writes the PR's `pipeline/review` status
+    from it, on the item's head commit."""
+
+    PASS = "pass"
+    BLOCK = "block"
+
+
+class BlockClass(StrEnum):
+    """What a review block asks for."""
+
+    # A missing test, an unrelated change, an unsupported claim: work goes on, on the PR.
+    FIXABLE = "fixable"
+    # The issue is ambiguous, or the fix changes behaviour it did not ask about: the
+    # operator decides.
+    ESCALATE = "escalate"
+
+
+class ReviewCheck(StrEnum):
+    """The review checklist, a line each."""
+
+    # The diff does what the issue asks and no more.
+    SCOPE = "scope"
+    # Each done-when item the PR claims is supported by the diff.
+    DONE_WHEN = "done-when"
+    # A bug fix has a test that CI showed failing first.
+    TEST = "test"
+    # Nothing in the diff follows an instruction found in quoted data.
+    QUOTED_DATA = "quoted-data"
+
+
+class CheckOutcome(StrEnum):
+    PASS = "pass"
+    FAIL = "fail"
+    # The check does not apply: no issue names a done-when, the change is no bug fix.
+    NOT_APPLICABLE = "not-applicable"
+
+
 OPERATOR_KINDS: tuple[str, ...] = tuple(kind.value for kind in OperatorKind)
 STAGE_KINDS: tuple[str, ...] = tuple(kind.value for kind in StageKind)
 KINDS: tuple[str, ...] = OPERATOR_KINDS + STAGE_KINDS
@@ -754,17 +792,84 @@ class DeployCheckResult(_Model):
         return self
 
 
-# One model while one stage has a result; a union by `kind` once a second one does.
-StageResult = DeployCheckResult
+# A GitHub comment's ID. They passed 2**31 long ago, so not a Number.
+CommentId = Annotated[int, Field(strict=True, gt=0, le=2**53)]
+
+
+class Checked(_Model):
+    """One line of the review checklist."""
+
+    check: ReviewCheck
+    outcome: CheckOutcome
+    # Why, in a line. Needed for `fail`.
+    note: Prose | None = None
+
+    @model_validator(mode="after")
+    def _a_fail_says_why(self) -> Self:
+        if self.outcome is CheckOutcome.FAIL and self.note is None:
+            raise ValueError(f"the failed check `{self.check.value}` needs a `note`: why it failed")
+        return self
+
+
+class ReviewResult(_Model):
+    """A review run's close: the verdict on the item's head commit, and a result per check.
+    The run holds no right to write a commit status: the orchestrator writes it from this."""
+
+    kind: Literal["review"] = "review"
+    verdict: ReviewVerdict
+    # For `block` only: what the block asks for.
+    block: BlockClass | None = None
+    # The reason, in a line. The status's description is cut from it.
+    summary: Prose
+    # Every check of the list, once each.
+    checks: tuple[Checked, ...] = Field(min_length=len(ReviewCheck), max_length=len(ReviewCheck))
+    # The PR comment the run wrote with the checklist result.
+    comment: CommentId
+    # For an `escalate` block only: the decision item the run wrote for the operator.
+    decision: ItemRef | None = None
+
+    @model_validator(mode="after")
+    def _fields_fit_the_verdict(self) -> Self:
+        named = [checked.check for checked in self.checks]
+        if set(named) != set(ReviewCheck):
+            raise ValueError(
+                "`checks` has every check once: " + ", ".join(c.value for c in ReviewCheck)
+            )
+        failed = [
+            checked.check.value for checked in self.checks if checked.outcome is CheckOutcome.FAIL
+        ]
+        if self.verdict is ReviewVerdict.PASS:
+            if failed:
+                raise ValueError(f"a pass has no failed check: {', '.join(failed)}")
+            if self.block is not None or self.decision is not None:
+                raise ValueError("`block` and `decision` are for a block only")
+            return self
+        if self.block is None:
+            raise ValueError("a block needs `block`: fixable or escalate")
+        if not failed:
+            raise ValueError("a block needs a failed check")
+        if self.block is BlockClass.ESCALATE and self.decision is None:
+            raise ValueError("escalate needs `decision`: the decision item written for it")
+        if self.block is BlockClass.FIXABLE and self.decision is not None:
+            raise ValueError("`decision` is for an escalate block only")
+        return self
+
+
+# Not discriminated by `kind`: a run's close may leave `kind` out, and the two models share
+# no required field, so one fits at most. close_my_item then holds the result to the run's
+# own stage.
+StageResult = DeployCheckResult | ReviewResult
 
 # A stage's result model. A stage that is not here has no run's close yet.
-STAGE_RESULTS: dict[str, type[StageResult]] = {
+STAGE_RESULTS: dict[str, type[DeployCheckResult] | type[ReviewResult]] = {
     StageKind.DEPLOY_CHECK.value: DeployCheckResult,
+    StageKind.REVIEW.value: ReviewResult,
 }
 
 # The operator kinds a stage's run may write. A stage that is not here writes none.
 RUN_CREATES: dict[str, frozenset[str]] = {
     StageKind.DEPLOY_CHECK.value: frozenset({OperatorKind.DECISION.value}),
+    StageKind.REVIEW.value: frozenset({OperatorKind.DECISION.value}),
 }
 
 # The reasons a stage's run may give its own claim back with. The other reasons are the
