@@ -748,6 +748,34 @@ async def test_the_reconciler_s_other_items_are_the_operator_s(board: Board) -> 
     assert [entry["id"] for entry in await pipeline(board)] == [item_id]
 
 
+async def test_the_reconciler_writes_a_keyed_urgent_item_once(board: Board) -> None:
+    # The tripwire's finding is on a commit, not on an issue: a key names it.
+    created = await board.call(
+        AS_RECONCILER, "write_operator_item", item=KEYED, key=KEY, urgent=True
+    )
+    item = created["item"]
+    assert (created["status"], item["key"], item["urgent"]) == ("created", KEY, True)
+    assert item["held_by"] == OPERATOR.identity
+    # A second write returns the open one, with the urgency it has.
+    again = await board.call(AS_RECONCILER, "write_operator_item", item=KEYED, key=KEY)
+    assert (again["status"], again["item"]["id"]) == ("already open", item["id"])
+    assert again["item"]["urgent"] is True
+    listed = (await board.call(AS_OPERATOR, "list_items"))["items"]
+    assert [entry["id"] for entry in listed] == [item["id"]]
+    # Closed, the key is free: whether to write it again is the reconciler's to decide.
+    await board.call(AS_OPERATOR, "done", item_id=item["id"])
+    assert [entry["id"] for entry in await pipeline(board)] == []
+    later = await board.call(AS_RECONCILER, "write_operator_item", item=KEYED, key=KEY)
+    assert (later["status"], later["item"]["urgent"]) == ("created", False)
+
+
+async def test_the_reconciler_s_item_is_not_urgent_unless_it_says_so(board: Board) -> None:
+    created = await board.call(AS_RECONCILER, "write_operator_item", item=DECISION)
+    assert created["item"]["urgent"] is False
+    with pytest.raises(ToolError, match="needs a ticket or a key"):
+        await board.call(AS_RECONCILER, "write_operator_item", item=KEYED)
+
+
 async def test_a_stage_item_closes_as_superseded_only(board: Board) -> None:
     created = await board.call(AS_RECONCILER, "write_stage_item", item=REVIEW)
     item_id = created["item"]["id"]

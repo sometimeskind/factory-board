@@ -326,6 +326,7 @@ def _new_item(
     identity: Identity,
     after: list[str],
     holds: bool = True,
+    urgent: bool = False,
 ) -> NewItem:
     if isinstance(item, PrApprove | PrMerge):
         # A PR item is about the PR its fields name, and nothing else.
@@ -350,6 +351,7 @@ def _new_item(
         operator_typed=identity.operator_typed,
         after=tuple(after),
         holds=holds,
+        urgent=urgent,
     )
 
 
@@ -442,9 +444,10 @@ def build_server(
         holder: str,
         after: list[str],
         holds: bool = True,
+        urgent: bool = False,
     ) -> dict[str, Any]:
         created = await store.create_item(
-            identity.caller, _new_item(item, key, holder, identity, after, holds)
+            identity.caller, _new_item(item, key, holder, identity, after, holds, urgent)
         )
         if not created.existing:
             record(verb, created.item, identity)
@@ -836,11 +839,21 @@ def build_server(
         item: OperatorItem,
         after: After = [],  # noqa: B006
         holds: bool = True,
+        key: Key | None = None,
+        urgent: Annotated[
+            bool,
+            Field(description="true for a finding that can't wait for the operator's next look"),
+        ] = False,
     ) -> dict[str, Any]:
         """Write an item for the operator, from a fact GitHub shows. The reconciler holds a
         pr-approve or pr-merge item and closes it when GitHub shows the approval or the merge;
         the operator holds every other kind. One PR item is open per PR: a second write
-        returns it, with its head SHA moved if the new one differs."""
+        returns it, with its head SHA moved if the new one differs.
+
+        `key` names what the item is about when no issue does (the tripwire's finding on a
+        commit): at most one item is open per key, and a second write returns the open one,
+        as it is. `urgent` writes the item urgent: it is listed first, and pushed once it has
+        been open for 15 minutes. An item that was already open keeps its own urgency."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             holder = (
@@ -848,7 +861,7 @@ def build_server(
                 if isinstance(item, PrApprove | PrMerge)
                 else operator_identity
             )
-            return await create("create", identity, item, None, holder, after, holds)
+            return await create("create", identity, item, key, holder, after, holds, urgent)
 
         return await call("write_operator_item", RECONCILER, run)
 
