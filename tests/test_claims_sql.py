@@ -935,7 +935,8 @@ def test_two_expiries_in_a_row_write_one_decision_for_the_operator(
         "process:dispatcher",
         None,
         False,
-        urgent,
+        # Urgent whatever the item is (0015): the item it stops is out of the queue.
+        True,
     )
     wanted = {"subject_repo": REPO, **SUBJECTS[about]}
     if about == "key":
@@ -1146,7 +1147,7 @@ def decision_of(owner: psycopg.Connection, item_id: str) -> str | None:
 def test_two_failed_runs_in_a_row_expired_or_refused_write_the_decision(
     app_url: str, owner: psycopg.Connection, failures: tuple[str, str]
 ) -> None:
-    insert_stage_row(owner, ITEM, urgent=True)
+    insert_stage_row(owner, ITEM)
     runs = ("20260101-work-01", "20260102-work-01")
     told = {"expired": "ran out of time", "refused": "left no result that could be accepted"}
 

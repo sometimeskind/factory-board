@@ -377,7 +377,7 @@ async def test_a_run_closes_its_item_within_its_claim(store: Store) -> None:
 async def test_two_expiries_in_a_row_write_a_decision_the_item_waits_on(
     store: Store, conn: psycopg.Connection
 ) -> None:
-    item = (await store.create_item(RECONCILER, replace(stage("work", 101), urgent=True))).item
+    item = (await store.create_item(RECONCILER, stage("work", 101))).item
     assert (await run_out(store, conn, item.id, "20260101-work-01")).decision_id is None
     second = await run_out(store, conn, item.id, "20260101-work-02")
     assert second.decision_id is not None
@@ -407,8 +407,8 @@ async def test_two_expiries_in_a_row_write_a_decision_the_item_waits_on(
 
     claims = await store.list_claims(SESSION, item.id)
     assert [(c.run, c.item_id, c.stage, c.urgent, c.ending, c.decision_id) for c in claims] == [
-        ("20260101-work-01", item.id, "work", True, "expired", decision.id),
-        ("20260101-work-02", item.id, "work", True, "expired", decision.id),
+        ("20260101-work-01", item.id, "work", False, "expired", decision.id),
+        ("20260101-work-02", item.id, "work", False, "expired", decision.id),
     ]
     assert all(c.ended_at is not None and c.reason is None for c in claims)
 
