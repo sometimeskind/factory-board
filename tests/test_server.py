@@ -1177,7 +1177,8 @@ async def test_two_expiries_in_a_row_ask_the_operator(
     assert (asked["kind"], asked["subject"], asked["urgent"]) == (
         "decision",
         f"pr {REPO}#202",
-        False,
+        # Urgent though the review item is not (0015).
+        True,
     )
     assert (asked["held_by"], asked["created_by"]) == (OPERATOR.identity, DISPATCHER.identity)
     assert asked["operator_typed"] is False

@@ -235,7 +235,7 @@ check the caller; no tier may write the claim columns or the counters.
   whose claim has run out can no longer close its item, counted or not.
 - **Two failed runs in a row** on one item, each an expiry or a `result-refused` release
   (other releases in between are skipped), write a `decision` item for the operator, about
-  the item's subject and urgent if the item is. Its summary says how each run failed (ran
+  the item's subject and always urgent, since the item it stops is out of the queue. Its summary says how each run failed (ran
   out of time, or left no result that could be accepted). The item waits on it (the one
   edge the board writes after an item exists), so it is in no queue. The decision's first
   option, "try again", lets the item go for two more runs. Any other close of the decision

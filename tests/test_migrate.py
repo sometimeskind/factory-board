@@ -212,7 +212,10 @@ def test_0014_applies_on_a_database_at_0013(
         tier.execute("SELECT release_claim('aaaaaaaa', 'stopped', NULL)")
     claim("20260101-review-03")
 
-    assert apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR) == ["0014_result_refused"]
+    assert apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR) == [
+        "0014_result_refused",
+        "0015_urgent_failed_run_decision",
+    ]
     with as_tier(app_url, DISPATCHER) as tier:
         tier.execute(
             "SELECT release_claim('aaaaaaaa', 'result-refused', NULL, %s)", (OPERATOR.identity,)
@@ -228,3 +231,7 @@ def test_0014_applies_on_a_database_at_0013(
         ("20260101-review-03", "released", "result-refused", decision),
     ]
     assert conn.execute("SELECT * FROM item_after").fetchall() == [("aaaaaaaa", decision)]
+    # 0015: the decision is urgent though the item is not.
+    assert conn.execute(
+        "SELECT i.urgent FROM items AS i ORDER BY i.id = %s", (decision,)
+    ).fetchall() == [(False,), (True,)]
