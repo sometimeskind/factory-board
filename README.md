@@ -162,6 +162,9 @@ the operator's is not orphaned.
   10), and with `closed_as` it is written closed, as a record.
 - `write_operator_item` writes any operator kind. The reconciler holds a `pr-approve` or
   `pr-merge` item it writes; the operator holds the rest.
+  With `key` the item is about a finding and not an issue (the tripwire's, on a commit),
+  one open item per key; with `urgent` it is written urgent. An item that was already
+  open is returned as it is.
 - `close_for_fact` closes a PR item the reconciler holds (done or superseded) or a stage
   item nobody holds (superseded only), with `{"cause": <name>}` as the result. The policy
   `items_update_reconciler` allows the second for `process:reconciler` alone.
