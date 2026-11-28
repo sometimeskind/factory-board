@@ -22,6 +22,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import (
     AfterValidator,
+    AwareDatetime,
     BaseModel,
     ConfigDict,
     Field,
@@ -197,6 +198,43 @@ class CheckOutcome(StrEnum):
     FAIL = "fail"
     # The check does not apply: no issue names a done-when, the change is no bug fix.
     NOT_APPLICABLE = "not-applicable"
+
+
+class AssessOutcome(StrEnum):
+    """What an assess run decided for its issue."""
+
+    # The issue fits one PR per repo and passes the rubric: the run wrote the `work` item.
+    WORK = "work"
+    # A step or a decision is the operator's: the run wrote the items.
+    OPERATOR = "operator"
+    # A done-when item can't be judged yet: the board writes the dated `assess` item.
+    WAIT = "wait"
+    # Every done-when item is met: the run closed the issue with the evidence per item.
+    CLOSE = "close"
+    # Too large for one PR per repo and no plan: the run wrote a `session` item.
+    PLAN = "plan"
+    # Open items already cover the issue: nothing was written.
+    NONE = "none"
+
+
+class DoneWhenState(StrEnum):
+    MET = "met"
+    UNMET = "unmet"
+    # Not yet: a soak, a renewal, a date. A `wait` names when to look again.
+    CANNOT_JUDGE = "cannot-judge"
+
+
+class RubricCheck(StrEnum):
+    """The pick-up rubric, a line each: what an issue needs before work starts on it."""
+
+    # Each done-when item can be verified.
+    VERIFIABLE = "verifiable"
+    # The issue picks one behaviour.
+    ONE_BEHAVIOUR = "one-behaviour"
+    # The fix is reachable with PRs alone: no step of it needs the operator's hands.
+    PRS_ALONE = "prs-alone"
+    # The repo and the files the fix will touch are named.
+    LOCATED = "located"
 
 
 OPERATOR_KINDS: tuple[str, ...] = tuple(kind.value for kind in OperatorKind)
@@ -855,21 +893,164 @@ class ReviewResult(_Model):
         return self
 
 
-# Not discriminated by `kind`: a run's close may leave `kind` out, and the two models share
-# no required field, so one fits at most. close_my_item then holds the result to the run's
-# own stage.
-StageResult = DeployCheckResult | ReviewResult
+# A path in a repo, as git spells it: no leading slash, no `..`.
+def _a_repo_path(value: str) -> str:
+    if ".." in value.split("/") or value.endswith("/") or "//" in value:
+        raise ValueError("a path in the repo: no `..`, no empty part, no trailing slash")
+    return value
+
+
+RepoPath = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9._][A-Za-z0-9._/@+-]{0,254}$"),
+    AfterValidator(_a_repo_path),
+]
+
+
+class IssueWork(_Model):
+    """The `work` item an assess run writes for its issue: one PR in one repo. It is no
+    member of StageItem: only an assess run writes one, with write_work_item, and the
+    continuation item (`Work`) stays the reconciler's."""
+
+    kind: Literal["work"] = "work"
+    issue: Ticket
+    # The repo the PR goes in.
+    repo: Repo
+    # The files the fix will touch, as far as assess could tell.
+    files: tuple[RepoPath, ...] = Field(min_length=1, max_length=30)
+    # For a fix forward: where the fault shows. Pointers, not quotes.
+    evidence: tuple[Prose, ...] = Field(default=(), max_length=10)
+
+    @model_validator(mode="after")
+    def _files_differ(self) -> Self:
+        if len(set(self.files)) != len(self.files):
+            raise ValueError("a file is named twice")
+        return self
+
+    @property
+    def subject(self) -> Subject:
+        return Subject(repo=self.issue.repo, type=SubjectType.ISSUE, ref=self.issue.number)
+
+
+class DoneWhen(_Model):
+    """One done-when item of the issue, and where it stands."""
+
+    # Which item: its number in the issue's list, or its first words.
+    item: Prose
+    state: DoneWhenState
+    # Where to look: a log query, a pod, a PR, an alert. A pointer, not a quote.
+    evidence: Prose
+
+
+class RubricChecked(_Model):
+    """One line of the pick-up rubric."""
+
+    check: RubricCheck
+    outcome: CheckOutcome
+    # Why, in a line. Needed for `fail`.
+    note: Prose | None = None
+
+    @model_validator(mode="after")
+    def _a_fail_says_why(self) -> Self:
+        if self.outcome is CheckOutcome.FAIL and self.note is None:
+            raise ValueError(f"the failed check `{self.check.value}` needs a `note`: why it failed")
+        return self
+
+
+class Wait(_Model):
+    """When to assess the issue again, and what to check then."""
+
+    not_before: AwareDatetime
+    note: Prose
+
+
+class AssessResult(_Model):
+    """An assess run's close: what it decided for the issue, where each done-when item
+    stands, and the rubric. What follows is on the board already (the `work` item, the
+    operator's items) or is written by the board from this close (the dated `assess` item
+    of a `wait`)."""
+
+    kind: Literal["assess"] = "assess"
+    outcome: AssessOutcome
+    # The reason, in a line.
+    summary: Prose
+    # A row per done-when item. None for an issue that names no done-when.
+    done_when: tuple[DoneWhen, ...] = Field(default=(), max_length=30)
+    # Every check of the rubric, once each.
+    rubric: tuple[RubricChecked, ...] = Field(
+        min_length=len(RubricCheck), max_length=len(RubricCheck)
+    )
+    # For `work` only: the `work` item the run wrote.
+    work: ItemRef | None = None
+    # The operator's items the run wrote. Needed for `operator` and `plan`.
+    items: tuple[ItemRef, ...] = Field(default=(), max_length=10)
+    # For `wait` only: the board writes the issue's next `assess` item from it.
+    wait: Wait | None = None
+    # For `close` only: the comment the issue was closed with.
+    comment: CommentId | None = None
+
+    @model_validator(mode="after")
+    def _fields_fit_the_outcome(self) -> Self:
+        named = [checked.check for checked in self.rubric]
+        if set(named) != set(RubricCheck):
+            raise ValueError(
+                "`rubric` has every check once: " + ", ".join(c.value for c in RubricCheck)
+            )
+        if len(set(self.items)) != len(self.items):
+            raise ValueError("an item is named twice")
+        outcome = self.outcome
+        for name, wanted in (
+            ("work", AssessOutcome.WORK),
+            ("wait", AssessOutcome.WAIT),
+            ("comment", AssessOutcome.CLOSE),
+        ):
+            given = getattr(self, name) is not None
+            if given and outcome is not wanted:
+                raise ValueError(f"`{name}` is for the outcome {wanted.value} only")
+            if not given and outcome is wanted:
+                raise ValueError(f"{wanted.value} needs `{name}`")
+        states = [row.state for row in self.done_when]
+        if outcome is AssessOutcome.WORK:
+            failed = [c.check.value for c in self.rubric if c.outcome is CheckOutcome.FAIL]
+            if failed:
+                raise ValueError(f"work needs a rubric with no failed check: {', '.join(failed)}")
+        if outcome in (AssessOutcome.OPERATOR, AssessOutcome.PLAN) and not self.items:
+            raise ValueError(f"{outcome.value} needs `items`: the items written for the operator")
+        if outcome is AssessOutcome.NONE and self.items:
+            raise ValueError("none writes nothing: leave `items` out")
+        if outcome is AssessOutcome.WAIT and DoneWhenState.CANNOT_JUDGE not in states:
+            raise ValueError("wait needs a done-when item that can't be judged yet")
+        if outcome is AssessOutcome.CLOSE and (
+            not states or any(state is not DoneWhenState.MET for state in states)
+        ):
+            raise ValueError("close needs every done-when item met, and at least one")
+        return self
+
+
+# Not discriminated by `kind`: a run's close may leave `kind` out. Each model forbids a
+# field it does not know and needs one the others lack, so one fits at most. close_my_item
+# then holds the result to the run's own stage.
+StageResult = DeployCheckResult | ReviewResult | AssessResult
 
 # A stage's result model. A stage that is not here has no run's close yet.
-STAGE_RESULTS: dict[str, type[DeployCheckResult] | type[ReviewResult]] = {
+STAGE_RESULTS: dict[
+    str, type[DeployCheckResult] | type[ReviewResult] | type[AssessResult]
+] = {
     StageKind.DEPLOY_CHECK.value: DeployCheckResult,
     StageKind.REVIEW.value: ReviewResult,
+    StageKind.ASSESS.value: AssessResult,
 }
 
-# The operator kinds a stage's run may write. A stage that is not here writes none.
+# The operator kinds a stage's run may write. A stage that is not here writes none. An
+# assess run writes every kind but the two the reconciler writes from a PR's facts.
 RUN_CREATES: dict[str, frozenset[str]] = {
     StageKind.DEPLOY_CHECK.value: frozenset({OperatorKind.DECISION.value}),
     StageKind.REVIEW.value: frozenset({OperatorKind.DECISION.value}),
+    StageKind.ASSESS.value: frozenset(
+        kind.value
+        for kind in OperatorKind
+        if kind not in (OperatorKind.PR_APPROVE, OperatorKind.PR_MERGE)
+    ),
 }
 
 # The reasons a stage's run may give its own claim back with. The other reasons are the
