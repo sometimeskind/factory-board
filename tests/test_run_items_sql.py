@@ -19,6 +19,8 @@ from factory_board.store import Caller
 # The run ID of helpers.RUN, which created_run must repeat.
 RUN_ID = RUN.identity.partition(":")[2]
 CHECK = "dddddddd"
+# Who helpers.VALID_ROW says wrote a row the owner inserts.
+VALID_CREATOR = "session:0a1b2c3d"
 
 
 @pytest.fixture
@@ -112,3 +114,82 @@ def test_a_run_s_close_still_wakes_assess(app_url: str, owner: psycopg.Connectio
         "SELECT subject_ref, created_by, claimed_by FROM items "
         "WHERE kind = 'assess' AND closed_at IS NULL"
     ).fetchall() == [("101", "process:board", None)]
+
+
+# ---- an assess run's work item (0016) ----
+
+
+def holds_assess(owner: psycopg.Connection, number: int = 101, expires: str = "1 hour") -> None:
+    """The run of helpers.RUN holds the issue's open assess item, its claim still running."""
+    insert_stage_row(
+        owner,
+        "eeeeeeee",
+        assignee="assess",
+        subject_ref=str(number),
+        claimed_by=RUN.identity,
+    )
+    owner.execute(
+        "UPDATE items SET claim_expires = now() + %s::interval WHERE kind = 'assess'", (expires,)
+    )
+
+
+def insert_work_as_run(app_url: str, **overrides: object) -> None:
+    with as_tier(app_url, RUN) as conn:
+        insert_stage_row(
+            conn, "wwwwwwww", **{"created_by": RUN.identity, "created_run": RUN_ID} | overrides
+        )
+
+
+def test_an_assess_run_inserts_its_issue_s_work_item(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    holds_assess(owner)
+    insert_work_as_run(app_url)
+    assert kinds(owner) == [("assess", VALID_CREATOR), ("work", RUN.identity)]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"subject_ref": "102"},
+        {"subject_repo": "example/other"},
+        {"subject_type": "pr", "subject_ref": "101"},
+        {"claimed_by": RUN.identity},
+        {"assignee": "review"},
+        {"assignee": "assess", "subject_ref": "102"},
+    ],
+    ids=["another issue", "another repo", "a pr", "held", "a review item", "an assess item"],
+)
+def test_an_assess_run_inserts_no_other_stage_item(
+    app_url: str, owner: psycopg.Connection, overrides: dict[str, object]
+) -> None:
+    holds_assess(owner)
+    with pytest.raises(errors.InsufficientPrivilege, match="items_insert_no_run_stage_item"):
+        insert_work_as_run(app_url, **overrides)
+
+
+def test_a_run_whose_assess_claim_ended_inserts_no_work_item(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    holds_assess(owner, expires="-1 minute")
+    with pytest.raises(errors.InsufficientPrivilege, match="items_insert_no_run_stage_item"):
+        insert_work_as_run(app_url)
+    # Another run's claim, and a closed item, give this run nothing either.
+    owner.execute("UPDATE items SET claim_expires = now() + interval '1 hour'")
+    owner.execute("UPDATE items SET claimed_by = 'run:20260101-assess-09' WHERE kind = 'assess'")
+    with pytest.raises(errors.InsufficientPrivilege, match="items_insert_no_run_stage_item"):
+        insert_work_as_run(app_url)
+
+
+def test_a_wait_whose_date_does_not_parse_closes_and_writes_nothing(
+    app_url: str, owner: psycopg.Connection
+) -> None:
+    holds_assess(owner)
+    with as_tier(app_url, RUN) as conn:
+        closed = conn.execute(
+            "UPDATE items SET closed_at = now(), resolution = 'done', result = %s "
+            "WHERE kind = 'assess'",
+            (Jsonb({"outcome": "wait", "wait": {"not_before": "next week", "note": "x"}}),),
+        )
+        assert closed.rowcount == 1
+    assert owner.execute("SELECT count(*) FROM items WHERE closed_at IS NULL").fetchone() == (0,)

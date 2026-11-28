@@ -1189,3 +1189,50 @@ class Store:
                 "SELECT * FROM replies WHERE item_id = %s ORDER BY created_at, id", (item_id,)
             )
             return [_reply(row) for row in await cur.fetchall()]
+
+    async def list_about(
+        self, caller: Caller, subject: Subject, *, limit: int = 50
+    ) -> list[tuple[Item, list[Reply]]]:
+        """Every item about the subject, open and closed, each with its replies; oldest
+        first, and the newest `limit` when there are more.
+
+        About an issue is an item whose subject it is, of any assignee, and an operator's
+        item about something else that names it as its ticket (a `pr-approve` or `pr-merge`
+        item, a keyed item). A `deploy-check` that lists the issue is not included: it is
+        about its PR. Written out here, as `item_issues()` is no tier's to call.
+        """
+        async with self._as(caller) as conn:
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                sql.SQL(
+                    """
+                SELECT * FROM (
+                    SELECT {} FROM items
+                    WHERE (
+                            subject_type = %(type)s::text
+                            AND subject_ref = %(ref)s::text
+                            AND subject_repo IS NOT DISTINCT FROM %(repo)s::text
+                          )
+                       OR (
+                            %(type)s::text = 'issue'
+                            AND assignee = 'operator'
+                            AND subject_type IS DISTINCT FROM 'issue'
+                            AND fields #>> '{{ticket,repo}}' = %(repo)s::text
+                            AND fields #>> '{{ticket,number}}' = %(ref)s::text
+                          )
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %(limit)s
+                ) AS about
+                ORDER BY created_at, id
+                """
+                ).format(_ITEM),
+                {"type": subject.type, "ref": subject.ref, "repo": subject.repo, "limit": limit},
+            )
+            items = [_item(row) for row in await cur.fetchall()]
+            cur = await conn.cursor(row_factory=dict_row).execute(
+                "SELECT * FROM replies WHERE item_id = ANY(%s) ORDER BY created_at, id",
+                ([item.id for item in items],),
+            )
+            replies: dict[str, list[Reply]] = {item.id: [] for item in items}
+            for row in await cur.fetchall():
+                replies[row["item_id"]].append(_reply(row))
+        return [(item, replies[item.id]) for item in items]

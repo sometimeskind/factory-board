@@ -146,7 +146,7 @@ port of their own. A tool outside the caller's row is refused.
 | Nightly | `create_keyed_item`, `list_own_items`, `close_own_item` |
 | Reconciler | `write_stage_item`, `write_operator_item`, `close_for_fact`, `heartbeat`, `pause`, `list_items`, `get_item`, `list_pipeline_items`, `list_assessments` |
 | Dispatcher | `list_claimable`, `claim`, `release`, `get_item`, `list_pipeline_items`, `list_assessments` |
-| Run | `my_item`, `close_my_item`, `release_my_item`, `create_item` |
+| Run | `my_item`, `close_my_item`, `release_my_item`, `create_item`; an assess run also `my_issue_items`, `write_work_item` |
 
 The operator and a session also have `list_pipeline_items` and `list_assessments`: the
 pipeline's queue can be read by every caller but the nightly and a run. The three processes
@@ -257,8 +257,8 @@ run holds.
 - `my_item` reads that item, as `get_item` shows it. A run reads no other item.
 - `close_my_item` closes it as done, with the stage's result fields as the item's `result`.
   It is the run's last act. The fields are a model per stage (`STAGE_RESULTS` in
-  `factory_board/kinds.py`); a stage without one can't close yet. `deploy-check` and
-  `review` have one. A deploy-check's:
+  `factory_board/kinds.py`); a stage without one can't close yet. `deploy-check`,
+  `review` and `assess` have one. A deploy-check's:
 
   | Field | Holds |
   |---|---|
@@ -280,19 +280,43 @@ run holds.
   | `comment` | The ID of the PR comment the run wrote with the checklist result |
   | `decision` | For an `escalate` block only: the `decision` item the run wrote. The board checks that this run wrote it |
 
+  An assess run's. The board checks that this run wrote every item the result names.
+
+  | Field | Holds |
+  |---|---|
+  | `outcome` | `work`, `operator`, `wait`, `close`, `plan` or `none` |
+  | `summary` | The reason, in a line |
+  | `done_when` | A row per done-when item of the issue: `item`, `state` (`met`, `unmet`, `cannot-judge`) and `evidence`, a pointer. A `wait` has a row that can't be judged; a `close` has every row met, and at least one |
+  | `rubric` | Every check once (`verifiable`, `one-behaviour`, `prs-alone`, `located`), each with an `outcome` and a `note`, which a `fail` needs. `work` has no failed check |
+  | `work` | For `work` only: the `work` item the run wrote with `write_work_item` |
+  | `items` | The operator's items the run wrote. `operator` and `plan` need one that holds the issue (its ticket is the issue, `holds` true); a `plan` has a `session` item among them; `none` has no item |
+  | `wait` | For `wait` only: `not_before` (ahead, at most 90 days) and `note`. The board writes the issue's next `assess` item from it, in the close's transaction (`migrations/0016_assess_run.sql`): reason `dated`, the note in its fields. When a wake waited on the held item, the item that wake wrote takes the reason and the note and stays due now |
+  | `comment` | For `close` only: the ID of the comment the issue was closed with |
+
 - `release_my_item` gives the item back with a reason the stage may give (`RUN_RELEASES`).
   A `deploy-check` whose change is not live yet releases with `not-live` and a `not_before`,
   at most a day ahead. The other reasons are the dispatcher's. A release ends the run too.
 - `create_item` writes an item for the operator, of the kinds the stage may write
   (`RUN_CREATES`): a `deploy-check` run a `decision`, for a change that is stuck, and a
-  `review` run a `decision`, for a block it escalates. The item
+  `review` run a `decision`, for a block it escalates, and an `assess` run a `decision`
+  or a `session`: it reads issue text, so it writes no item whose command the operator
+  would run, and proposes a step for the operator's hands inside a `decision`. The item
   is the run's (`created_by`, `created_run`) and the operator holds it.
 - This is checked in the server. In the database a run is an agent like a session: it may
   close the item it holds while its claim runs, and insert items as itself, but only items
   for the operator (`migrations/0012_no_run_stage_items.sql`): no run inserts a stage's
   item, of any stage. The items the board writes itself after a run's close (the `assess`
-  item a `deploy-check` wakes) are the board's and not the run's. The later PR that gives
-  `assess` its tools loosens the rule for an `assess` run's `work` item.
+  item a `deploy-check` wakes) are the board's and not the run's. One exception
+  (`migrations/0016_assess_run.sql`): a run that holds an issue's open `assess` item may
+  insert that issue's `work` item, held by nobody.
+- An assess run has two more tools. `my_issue_items` reads every item about its issue,
+  open and closed, each with the operator's replies: the items whose subject is the issue,
+  and the operator's PR and keyed items that name it as their ticket; the newest 50.
+  `write_work_item(repo, files, evidence)` writes the issue's `work` item (`IssueWork`:
+  one PR in one repo), with the `input_hash` of the run's own item, so a claim under
+  another hash closes it as stale. An open one is returned in its place. The board refuses
+  a fourth since the operator last acted on the issue (`BRD04`); the run then writes a
+  `decision` item and closes as `operator`.
 - An `unhealthy` close makes the `assess` item it wakes urgent, and one that names no issue
   wakes an urgent `assess` item on its PR ([What the board does by
   itself](#what-the-board-does-by-itself)).

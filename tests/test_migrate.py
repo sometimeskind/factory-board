@@ -215,6 +215,7 @@ def test_0014_applies_on_a_database_at_0013(
     assert apply_migrations(owner_url, DEFAULT_MIGRATIONS_DIR) == [
         "0014_result_refused",
         "0015_urgent_failed_run_decision",
+        "0016_assess_run",
     ]
     with as_tier(app_url, DISPATCHER) as tier:
         tier.execute(
