@@ -880,12 +880,17 @@ def build_server(
     ) -> dict[str, Any]:
         """Close an item because of what GitHub shows: a PR item the reconciler holds, as done
         (the approval or the merge is there) or as superseded (the head moved, the PR closed);
-        or a stage's item that no run holds, as superseded only."""
+        or a stage's item that no run holds, as superseded only. A merge item is the one
+        stage item with no run: it closes as done with the cause `merged`, when GitHub shows
+        the merge, and as superseded like the others."""
 
         async def run(identity: Identity) -> dict[str, Any]:
             item = await store.get_item(identity.caller, item_id)
             if item.assignee != "operator" and not superseded:
-                raise ToolError("a stage's item is closed as done by its run only")
+                if item.kind != "merge":
+                    raise ToolError("a stage's item is closed as done by its run only")
+                if cause != "merged":
+                    raise ToolError("a merge item is closed as done with the cause merged only")
             closed = await store.close_item(
                 identity.caller,
                 item_id,

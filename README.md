@@ -167,7 +167,9 @@ the operator's is not orphaned.
   open is returned as it is.
 - `close_for_fact` closes a PR item the reconciler holds (done or superseded) or a stage
   item nobody holds (superseded only), with `{"cause": <name>}` as the result. The policy
-  `items_update_reconciler` allows the second for `process:reconciler` alone.
+  `items_update_reconciler` allows the second for `process:reconciler` alone. A `merge`
+  item has no run to close it, so it also closes as done, with the cause `merged` only:
+  the merge script merges, and the reconciler closes the item when GitHub shows the merge.
 - `heartbeat` records that a pass finished, at the database's time (`record_heartbeat`,
   for `process:reconciler` alone). The metrics export it.
 

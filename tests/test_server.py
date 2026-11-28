@@ -776,6 +776,31 @@ async def test_the_reconciler_s_item_is_not_urgent_unless_it_says_so(board: Boar
         await board.call(AS_RECONCILER, "write_operator_item", item=KEYED)
 
 
+async def test_a_merge_item_closes_as_done_when_merged(board: Board) -> None:
+    merge = {"kind": "merge", "repo": REPO, "number": 207, "head_sha": SHA_A}
+    item_id = (await board.call(AS_RECONCILER, "write_stage_item", item=merge))["item"]["id"]
+    with pytest.raises(ToolError, match="with the cause merged only"):
+        await board.call(
+            AS_RECONCILER, "close_for_fact", item_id=item_id, cause="approved", superseded=False
+        )
+    with pytest.raises(ToolError):
+        await board.call(
+            AS_DISPATCHER, "close_for_fact", item_id=item_id, cause="merged", superseded=False
+        )
+    closed = await board.call(
+        AS_RECONCILER, "close_for_fact", item_id=item_id, cause="merged", superseded=False
+    )
+    assert closed["status"] == "done"
+    item = await board.call(AS_RECONCILER, "get_item", item_id=item_id)
+    assert (item["resolution"], item["result"]) == ("done", {"cause": "merged"})
+    # The head moved before the merge: superseded, like any stage item nobody holds.
+    other = {**merge, "number": 208}
+    other_id = (await board.call(AS_RECONCILER, "write_stage_item", item=other))["item"]["id"]
+    await board.call(AS_RECONCILER, "close_for_fact", item_id=other_id, cause="head-moved")
+    item = await board.call(AS_RECONCILER, "get_item", item_id=other_id)
+    assert (item["resolution"], item["result"]) == ("superseded", {"cause": "head-moved"})
+
+
 async def test_a_stage_item_closes_as_superseded_only(board: Board) -> None:
     created = await board.call(AS_RECONCILER, "write_stage_item", item=REVIEW)
     item_id = created["item"]["id"]
