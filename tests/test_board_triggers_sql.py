@@ -1233,6 +1233,7 @@ def test_the_board_s_functions_are_the_owner_s_and_one_is_called_by_a_tier(
                 "items_refuse_past_fix_forward_limit",
                 "items_take_pending_reasons",
                 "items_wake_assess",
+                "items_write_dated_assess",
                 "record_heartbeat",
                 "replies_note_operator_act",
             ],
@@ -1252,6 +1253,8 @@ def test_the_board_s_functions_are_the_owner_s_and_one_is_called_by_a_tier(
         # It only moves the row's own reasons and urgency, for whoever unclaims the item.
         ("items_take_pending_reasons", "", False, path, "board_owner", None),
         ("items_wake_assess", "", True, path, "board_owner", f"{{{mine}}}"),
+        # 0016: the dated item of an assess run's wait.
+        ("items_write_dated_assess", "", True, path, "board_owner", f"{{{mine}}}"),
         (
             "record_heartbeat",
             "",
@@ -1272,6 +1275,7 @@ def test_no_tier_wakes_assess_itself(
         "SELECT board_wake_assess('example/repo', 'issue', '101', ARRAY['changed'], true)",
         "SELECT items_wake_assess()",
         "SELECT items_carry_pending_wake()",
+        "SELECT items_write_dated_assess()",
         "SELECT items_note_operator_act()",
         "SELECT replies_note_operator_act()",
         "SELECT * FROM item_issues((SELECT i FROM items AS i LIMIT 1))",

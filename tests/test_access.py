@@ -661,8 +661,8 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
         "SELECT proname FROM pg_proc WHERE prosecdef AND pronamespace = 'public'::regnamespace "
         "ORDER BY proname"
     ).fetchall()
-    # Seven are triggers' functions, which nobody can call (the cascade, below, the two of
-    # the claims and the four of the board's own); the claims' own are pinned in
+    # Eight are triggers' functions, which nobody can call (the cascade, below, the two of
+    # the claims and the five of the board's own); the claims' own are pinned in
     # test_claims_sql.py and the board's in test_board_triggers_sql.py.
     assert definers == [
         ("claim_item",),
@@ -673,6 +673,7 @@ def test_the_head_sha_function_is_for_agents_and_processes_only(
         ("items_note_operator_act",),
         ("items_stop_after_expiries",),
         ("items_wake_assess",),
+        ("items_write_dated_assess",),
         ("lift_pause",),
         ("merge_assess_trigger",),
         ("record_heartbeat",),

@@ -108,7 +108,14 @@ TOOLS = {
     }
     | READS,
     "dispatcher": {"list_claimable", "claim", "release"} | READS,
-    "run": {"my_item", "close_my_item", "release_my_item", "create_item"},
+    "run": {
+        "my_item",
+        "close_my_item",
+        "release_my_item",
+        "create_item",
+        "my_issue_items",
+        "write_work_item",
+    },
 }
 RESULT: dict[str, Any] = {
     "kind": "deploy-check",
@@ -151,6 +158,8 @@ CALLS: dict[str, dict[str, Any]] = {
     "pause": {"reason": "the widget press is being moved"},
     "resume": {},
     "my_item": {},
+    "my_issue_items": {},
+    "write_work_item": {"repo": REPO, "files": ["press/config.yaml"]},
     "close_my_item": {"result": RESULT},
     "release_my_item": {"reason": "not-live", "not_before": AHEAD},
 }

@@ -1033,25 +1033,24 @@ class AssessResult(_Model):
 StageResult = DeployCheckResult | ReviewResult | AssessResult
 
 # A stage's result model. A stage that is not here has no run's close yet.
-STAGE_RESULTS: dict[
-    str, type[DeployCheckResult] | type[ReviewResult] | type[AssessResult]
-] = {
+STAGE_RESULTS: dict[str, type[DeployCheckResult] | type[ReviewResult] | type[AssessResult]] = {
     StageKind.DEPLOY_CHECK.value: DeployCheckResult,
     StageKind.REVIEW.value: ReviewResult,
     StageKind.ASSESS.value: AssessResult,
 }
 
 # The operator kinds a stage's run may write. A stage that is not here writes none. An
-# assess run writes every kind but the two the reconciler writes from a PR's facts.
+# assess run reads issue text, which is not all its author's (comments, quoted logs), so it
+# writes no item whose command the operator would run: a step for the operator's hands is
+# proposed inside a `decision` item (the operator's answer to item d4q67aga, 2026-11-28).
 RUN_CREATES: dict[str, frozenset[str]] = {
     StageKind.DEPLOY_CHECK.value: frozenset({OperatorKind.DECISION.value}),
     StageKind.REVIEW.value: frozenset({OperatorKind.DECISION.value}),
-    StageKind.ASSESS.value: frozenset(
-        kind.value
-        for kind in OperatorKind
-        if kind not in (OperatorKind.PR_APPROVE, OperatorKind.PR_MERGE)
-    ),
+    StageKind.ASSESS.value: frozenset({OperatorKind.DECISION.value, OperatorKind.SESSION.value}),
 }
+
+# How far ahead an assess run's `wait` may set the issue's next assess item.
+MAX_WAIT_DAYS = 90
 
 # The reasons a stage's run may give its own claim back with. The other reasons are the
 # dispatcher's: it knows why a run was interrupted.
